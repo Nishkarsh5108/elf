@@ -44,8 +44,11 @@ struct Params {
     int n_leaves = 80;       // leaf budget for the dictionary
     int near_k = 4;          // neighbours examined in sorted dictionary
     int bloom_lg = 0;        // 0 = no S3 bloom; else log2(bits)
-    int lookahead = 0;       // candidates evaluated with one step lookahead (0 = off)
+    int lookahead = 0;       // candidates evaluated with one step lookahead (0 = off, 1 = real-cost greedy)
     double la_weight = 0.4;  // lookahead: own + w * remaining
+    int la_alts = 3;         // alternative solutions kept per target
+    int la_slack = 1;        // solutions up to best+slack are kept
+    int la_width = 4;        // beam width for the remaining-cost estimate
     int seed = 1;
     double noise = 0.0;      // random tie-break noise added to target costs
     int threads = 8;
@@ -62,21 +65,37 @@ static inline u64 mix64(u64 x) {
 // ---------------------------------------------------------------- dictionary
 struct Expr { u64 v; int a, b; char op; uint8_t cost; };
 
-struct Index {  // open addressing value -> id, cheap clear
-    vector<u64> keys; vector<int> ids; vector<u64> used; u64 mask; size_t cap;
-    void init(int bits) { keys.assign(1ULL << bits, 0); ids.assign(1ULL << bits, -1); mask = (1ULL << bits) - 1; cap = (size_t)((1ULL << bits) * 0.7); used.clear(); }
+struct Index {  // open addressing value -> id; interleaved slots; resizable between builds
+    struct Slot { u64 key; int id; };
+    vector<Slot> tab; vector<u64> used; u64 mask = 0; size_t cap = 0; int bits = 0;
+    static const int FBITS = 25;              // presence filter (4 MB): rejects most misses in cache
+    vector<u64> filt = vector<u64>((1ULL << FBITS) / 64, 0);
+    static inline u64 fpos(u64 v) { return (mix64(v) >> 20) & ((1ULL << FBITS) - 1); }
+    void init(int b) { bits = b; tab.assign(1ULL << b, {0, -1}); mask = (1ULL << b) - 1; cap = (size_t)((1ULL << b) * 0.6); used.clear(); }
+    void ensure(size_t expected) {  // call on an empty index
+        int b = 16; while ((1ULL << b) * 0.5 < expected && b < 27) b++;
+        if (b != bits) init(b);
+    }
     inline int get(u64 v) const {
+        u64 f = fpos(v);
+        if (!(filt[f >> 6] >> (f & 63) & 1)) return -1;
         u64 i = mix64(v) & mask;
-        while (keys[i]) { if (keys[i] == v) return ids[i]; i = (i + 1) & mask; }
+        while (tab[i].key) { if (tab[i].key == v) return tab[i].id; i = (i + 1) & mask; }
         return -1;
     }
     inline bool insert(u64 v, int id) {
         if (used.size() >= cap) return false;
+        u64 f = fpos(v);
+        bool maybe = filt[f >> 6] >> (f & 63) & 1;
         u64 i = mix64(v) & mask;
-        while (keys[i]) { if (keys[i] == v) return false; i = (i + 1) & mask; }
-        keys[i] = v; ids[i] = id; used.push_back(i); return true;
+        if (maybe) while (tab[i].key) { if (tab[i].key == v) return false; i = (i + 1) & mask; }
+        else while (tab[i].key) i = (i + 1) & mask;
+        tab[i] = {v, id}; used.push_back(i); filt[f >> 6] |= 1ULL << (f & 63); return true;
     }
-    void clear() { for (u64 i : used) keys[i] = 0; used.clear(); }
+    void clear() {
+        for (u64 i : used) { u64 f = fpos(tab[i].key); filt[f >> 6] = 0; tab[i].key = 0; }
+        used.clear();
+    }
 };
 
 struct Bloom {
@@ -102,7 +121,7 @@ struct Dict {
     int n0 = 0, n1 = 0, n2 = 0;
     array<vector<pair<u64, int>>, 3> sorted;
     Bloom bloom;  // values of tree cost 3 (S2 op S0, S1 op S1)
-    Dict() { index.init(24); }
+    Dict() { index.init(20); }
     inline void add(u64 v, int a, int b, char op, int cost) {
         if (v > 0 && v <= L && index.insert(v, (int)e.size())) e.push_back({v, a, b, op, (uint8_t)cost});
     }
@@ -126,6 +145,11 @@ struct Dict {
     void build(const vector<u64> &leaves, u64 limit) {
         L = limit;
         index.clear(); e.clear();
+        {   // size the table for the expected dictionary
+            size_t n = leaves.size(), est = n * n * 3 + n * n * n * 6 + 1024;
+            if (est > (1ULL << 26)) est = 1ULL << 26;
+            index.ensure(max<size_t>(est / 4, 1 << 16));
+        }
         for (auto &s : sorted) s.clear();
         for (u64 v : leaves) add(v, -1, -1, 0, 0);
         n0 = e.size();
@@ -177,8 +201,10 @@ struct Dict {
 struct Link { int factor = -1, atom = -1; char op = 0; };  // op: '+' child[*f]+atom, '-' child[*f]-atom, 'r' atom-child, '/' child/atom
 struct State { u64 v; int cost = 0, parent = -1; Link link; double rank = 0; };
 
+struct Sol { int cost, end, term, kind; };
 struct Search {
     const Dict &d; const Params &P;
+    vector<Sol> sols; int slack = 0;
     int best = 1 << 28, end = -1;      // end = history index of terminal state
     int term = -1; int term_kind = 0;  // term: dict id (kind 0) or bloom value (kind 3, decomposed later)
     vector<State> history, next;
@@ -189,20 +215,24 @@ struct Search {
         if (v == 0 || v > d.L) return;
         int cost = history[p].cost + ecost(f) + ecost(a);
         if (op == '/') cost = history[p].cost + 1 + d.e[a].cost;  // child / atom: atom cost only
-        if (cost >= best) return;
+        if (cost > best + slack) return;
         int t = d.get(v);
         if (t >= 0) {
-            if (cost + d.e[t].cost < best) {
-                best = cost + d.e[t].cost; end = history.size(); term = t; term_kind = 0;
+            int tc = cost + d.e[t].cost;
+            if (tc <= best + slack) {
+                sols.push_back({tc, (int)history.size(), t, 0});
                 history.push_back({v, cost, p, {f, a, op}});
+                if (tc < best) { best = tc; end = history.size() - 1; term = t; term_kind = 0; }
             }
             return;
         }
-        if (d.bloom.on && cost + 3 < best && d.bloom.has(v)) {
+        if (cost >= best) return;
+        if (d.bloom.on && cost + 3 <= best + slack && d.bloom.has(v)) {
             char o; int x, y;
             if (d.decompose3(v, o, x, y)) {
-                best = cost + 3; end = history.size(); term_kind = 3; term = -1;
+                sols.push_back({cost + 3, (int)history.size(), -1, 3});
                 history.push_back({v, cost, p, {f, a, op}});
+                if (cost + 3 < best) { best = cost + 3; end = history.size() - 1; term_kind = 3; term = -1; }
                 return;
             }
         }
@@ -274,13 +304,13 @@ struct Search {
         }
     }
     void run(u64 target) {
-        history.clear(); next.clear(); visited.clear(); best = 1 << 28; end = -1;
+        history.clear(); next.clear(); visited.clear(); best = 1 << 28; end = -1; sols.clear();
         history.push_back({target, 0, -1, {}});
         int id = d.get(target);
-        if (id >= 0) { end = 0; term = id; term_kind = 0; best = d.e[id].cost; return; }
+        if (id >= 0) { end = 0; term = id; term_kind = 0; best = d.e[id].cost; sols.push_back({best, 0, id, 0}); return; }
         if (d.bloom.on && d.bloom.has(target)) {
             char o; int x, y;
-            if (d.decompose3(target, o, x, y)) { end = 0; term_kind = 3; best = 3; return; }
+            if (d.decompose3(target, o, x, y)) { end = 0; term_kind = 3; best = 3; sols.push_back({3, 0, -1, 3}); return; }
         }
         vector<int> front{0};
         for (int depth = 0; depth < 24 && !front.empty(); depth++) {
@@ -330,6 +360,7 @@ struct Planner {
     }
     vector<u64> palette;
     set<u64> done;
+    double t_build = 0, t_search = 0;
     u64 power(int k) {
         u64 v = 1ULL << k;
         if (have.count(v)) return v;
@@ -363,11 +394,12 @@ struct Planner {
         return lv;
     }
     // materialize the search result for target
-    void build_from(const Dict &d, Search &s, u64 target) {
+    void build_from(const Dict &d, Search &s, u64 target) { build_sol(d, s, {s.best, s.end, s.term, s.term_kind}, target); }
+    void build_sol(const Dict &d, Search &s, Sol sol, u64 target) {
         u64 v;
-        if (s.term_kind == 3) v = mat_bloom(d, s.history[s.end].v);
-        else v = mat(d, s.term);
-        for (int p = s.end; s.history[p].parent >= 0; p = s.history[p].parent) {
+        if (sol.kind == 3) v = mat_bloom(d, s.history[sol.end].v);
+        else v = mat(d, sol.term);
+        for (int p = sol.end; s.history[p].parent >= 0; p = s.history[p].parent) {
             Link l = s.history[p].link;
             if (l.op == '/') { v = make('/', v, mat(d, l.atom)); continue; }
             if (l.factor >= 0) v = make('*', v, mat(d, l.factor));
@@ -378,13 +410,88 @@ struct Planner {
         }
         if (v != target) throw runtime_error("reconstruction mismatch");
     }
+    void rollback(size_t n) {
+        while (order.size() > n) { u64 v = order.back(); order.pop_back(); have.erase(v); defs.erase(v); }
+    }
+    struct Cand { u64 t; vector<Node> nodes; };
+    void apply(const vector<Node> &nodes) {
+        for (auto &n : nodes) if (!have.count(n.v)) { have.insert(n.v); defs[n.v] = n; order.push_back(n.v); }
+    }
+    // sum of best costs of the given targets from the current state (searching with width w)
+    double remaining_cost(Dict &d, const vector<u64> &rem, int w) {
+        Params Q = P; Q.width = w;
+        d.build(leaves(), L);
+        Search s(d, Q);
+        double tot = 0;
+        for (u64 t : rem) {
+            if (have.count(t)) continue;
+            s.run(t);
+            tot += s.end < 0 ? 60 : s.best;
+        }
+        return tot;
+    }
+    void solve_lookahead(Dict &d) {
+        setup();
+        vector<u64> remaining;
+        for (u64 t : targets) if (!have.count(t)) remaining.push_back(t); else done.insert(t);
+        while (!remaining.empty()) {
+            d.build(leaves(), L);
+            Search s(d, P); s.slack = P.la_slack;
+            vector<Cand> cands;
+            for (u64 t : remaining) {
+                s.run(t);
+                if (s.end < 0) continue;
+                vector<Sol> so = s.sols;
+                sort(so.begin(), so.end(), [](const Sol &a, const Sol &b) { return a.cost < b.cost; });
+                int kept = 0; set<vector<u64>> seen;
+                for (auto &sol : so) {
+                    if (kept >= P.la_alts) break;
+                    size_t n0 = order.size();
+                    build_sol(d, s, sol, t);
+                    Cand c{t, {}};
+                    for (size_t k = n0; k < order.size(); k++) c.nodes.push_back(defs[order[k]]);
+                    rollback(n0);
+                    vector<u64> key; for (auto &n : c.nodes) key.push_back(n.v);
+                    if (!seen.insert(key).second) continue;
+                    cands.push_back(move(c)); kept++;
+                }
+            }
+            if (cands.empty()) { binary(remaining[0]); }
+            else {
+                stable_sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) { return a.nodes.size() < b.nodes.size(); });
+                int K = min<int>(P.lookahead, cands.size());
+                int bi = 0; double bs = 1e18;
+                if (K > 1) {
+                    for (int k = 0; k < K; k++) {
+                        size_t n0 = order.size();
+                        apply(cands[k].nodes);
+                        vector<u64> rest;
+                        for (u64 x : remaining) if (!have.count(x)) rest.push_back(x);
+                        double rc = remaining_cost(d, rest, P.la_width);
+                        rollback(n0);
+                        double sc = cands[k].nodes.size() + P.la_weight * rc;
+                        if (sc < bs) { bs = sc; bi = k; }
+                    }
+                }
+                apply(cands[bi].nodes);
+                if (P.verbose > 1) fprintf(stderr, "  target %llu built=%zu total=%zu remaining=%zu cands=%zu pick=%d\n", (unsigned long long)cands[bi].t, cands[bi].nodes.size(), order.size(), remaining.size(), cands.size(), bi);
+            }
+            vector<u64> rem2;
+            for (u64 x : remaining) if (!have.count(x)) rem2.push_back(x); else done.insert(x);
+            remaining.swap(rem2);
+        }
+    }
     void solve(Dict &d) {
+        if (P.lookahead > 0) { solve_lookahead(d); return; }
         setup();
         vector<u64> remaining;
         for (u64 t : targets) if (!have.count(t)) remaining.push_back(t); else done.insert(t);
         uniform_real_distribution<double> U(0, 1);
         while (!remaining.empty()) {
+            auto tb = chrono::steady_clock::now();
             d.build(leaves(), L);
+            t_build += chrono::duration<double>(chrono::steady_clock::now() - tb).count();
+            tb = chrono::steady_clock::now();
             Search s(d, P);
             int bi = -1; double bc = 1e18;
             for (int i = 0; i < (int)remaining.size(); i++) {
@@ -392,9 +499,12 @@ struct Planner {
                 double c = s.end < 0 ? 1e9 : s.best + (P.noise > 0 ? P.noise * U(rng) : 0.0);
                 if (c < bc) { bc = c; bi = i; }
             }
+            t_search += chrono::duration<double>(chrono::steady_clock::now() - tb).count();
             u64 t = remaining[bi];
             s.run(t);
+            size_t before = order.size();
             if (s.end < 0) binary(t); else build_from(d, s, t);
+            if (P.verbose > 1) fprintf(stderr, "  target %llu est=%d built=%zu total=%zu remaining=%zu\n", (unsigned long long)t, s.best, order.size() - before, order.size(), remaining.size());
             // any other targets that appeared as by-products are done too
             vector<u64> rem2;
             for (u64 x : remaining) if (!have.count(x)) rem2.push_back(x); else done.insert(x);
@@ -450,8 +560,30 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
     };
     for (u64 t : targets) mark(t);
     vector<u64> seq;
-    for (u64 v : order) if (need.count(v)) seq.push_back(v);
+    if (getenv("ELF_PLANORDER")) { for (u64 v : order) if (need.count(v)) seq.push_back(v); }
+    else {  // demand-driven: targets in planner order, each cone emitted depth-first just before use
+        set<u64> placed(startset), tset(targets.begin(), targets.end());
+        function<void(u64)> visit = [&](u64 v) {
+            if (!placed.insert(v).second) return;
+            const Node &n = defs.at(v);
+            visit(n.a); visit(n.b);
+            seq.push_back(v);
+        };
+        for (u64 v : order) if (tset.count(v)) visit(v);
+    }
     if (plan_size) *plan_size = seq.size();
+    if (getenv("ELF_LIVESTAT")) {  // max simultaneously live values in plan order
+        unordered_map<u64, int> last;
+        for (int i = 0; i < (int)seq.size(); i++) { const Node &n = defs.at(seq[i]); last[n.a] = i; last[n.b] = i; }
+        int live = 0, mx = 0; vector<int> ends(seq.size() + 1, 0);
+        for (u64 s0 : starts) if (last.count(s0)) { live++; ends[last[s0]]++; }
+        for (int i = 0; i < (int)seq.size(); i++) {
+            live++; mx = max(mx, live);
+            auto it = last.find(seq[i]); if (it == last.end()) live--; else ends[it->second]++;
+            live -= ends[i];
+        }
+        fprintf(stderr, "LIVESTAT maxlive=%d plan=%zu\n", mx, seq.size());
+    }
     // next-use lists
     unordered_map<u64, vector<int>> uses;  // positions (descending order stored; back() = next)
     for (int i = (int)seq.size() - 1; i >= 0; --i) {
@@ -471,16 +603,43 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
         const Node &n = defs.at(v);
         int ra = emit(n.a, locked);
         int rb = emit(n.b, locked | (1ULL << ra));
+        u64 outer = locked;
         locked |= (1ULL << ra) | (1ULL << rb);
         int rd = -1; i64 latest = -1;
-        for (int k = 0; k < 48; k++) {
+        // a source register whose value dies here may receive the result (operands are read first)
+        for (int k : {ra, rb}) {
+            if (outer >> k & 1) continue;
+            u64 old = bank[k];
+            auto it = uses.find(old);
+            bool dead = (it == uses.end() || it->second.empty()) && !seeds.count(old);
+            if (dead) { rd = k; latest = 1LL << 41; break; }
+        }
+        // rebuild cost of a value given current registers (instructions), capped
+        function<int(u64, int)> rcost = [&](u64 x, int depth) -> int {
+            for (int k = 0; k < 48; k++) if (occ[k] && bank[k] == x) return 0;
+            if (depth > 6 || !defs.count(x)) return 50;
+            const Node &m = defs.at(x);
+            int c = 1 + rcost(m.a, depth + 1);
+            if (m.b != m.a) c += rcost(m.b, depth + 1);
+            return min(c, 50);
+        };
+        double bestsc = -1;
+        if (rd < 0) for (int k = 0; k < 48; k++) {
             if (locked >> k & 1) continue;
             if (!occ[k]) { rd = k; break; }
             u64 old = bank[k];
             auto it = uses.find(old);
             i64 nu = (it == uses.end() || it->second.empty()) ? (1LL << 40) : it->second.back();
             if (seeds.count(old)) continue;  // seeds cannot be rebuilt
-            if (nu > latest) { latest = nu; rd = k; }
+            double sc;
+            if (nu >= (1LL << 40)) sc = 1e18;
+            else {
+                bank[k] ^= 0x8000000000000000ULL;  // pretend evicted while costing its rebuild
+                int rc = max(1, rcost(old, 0));
+                bank[k] ^= 0x8000000000000000ULL;
+                sc = double(nu - pos) / rc;
+            }
+            if (sc > bestsc) { bestsc = sc; rd = k; }
         }
         if (rd < 0) throw runtime_error("no register");
         prog.push_back({n.op, ra, rb, rd});
@@ -526,7 +685,13 @@ int main(int argc, char **argv) {
         else if (a == "-z") P.noise = stod(nx());
         else if (a == "-t") P.threads = stoi(nx());
         else if (a == "-v") P.verbose = 1;
+        else if (a == "-vv") P.verbose = 2;
         else if (a == "-p") P.palette = stoi(nx());
+        else if (a == "-la") P.lookahead = stoi(nx());
+        else if (a == "-lw") P.la_weight = stod(nx());
+        else if (a == "-lalt") P.la_alts = stoi(nx());
+        else if (a == "-lslack") P.la_slack = stoi(nx());
+        else if (a == "-lwidth") P.la_width = stoi(nx());
         else if (a == "-nd") P.n_done = stoi(nx());
         else inpath = a;
     }
@@ -554,6 +719,7 @@ int main(int argc, char **argv) {
             try {
                 Planner pl(pz.L, pz.s, pz.t, P);
                 pl.solve(d);
+                if (P.verbose) fprintf(stderr, "  time build=%.2fs search=%.2fs dict=%zu n1=%d\n", pl.t_build, pl.t_search, d.e.size(), d.n1);
                 int psz = 0;
                 auto prog = compile(pz.s, pz.t, pl.defs, pl.order, &psz);
                 string why = verify_prog(pz.L, pz.s, pz.t, prog);
