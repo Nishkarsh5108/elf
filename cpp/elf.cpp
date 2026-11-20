@@ -50,11 +50,14 @@ struct Params {
     int la_slack = 1;        // solutions up to best+slack are kept
     int la_width = 4;        // beam width for the remaining-cost estimate
     int la_inc = 1;          // evaluate lookahead candidates with an incremental dictionary
+    int lns_kmax = 4;        // LNS: max targets removed per move
+    int mitm = 0;            // root meet-in-the-middle with the S3 bloom
+    int rootfull = 0;        // root: use every dictionary value as a factor
     int seed = 1;
     double noise = 0.0;      // random tie-break noise added to target costs
     int threads = 8;
     int verbose = 0;
-    int palette = 1;         // build 1, powers of two and small odd constants up front (as leaves)
+    int palette = 2;         // 2 = eager constants (free leaves), 1 = virtual (charged when used), 0 = none
     int n_done = 52;         // leaves: previous targets (largest first) up to this many leaves
 };
 
@@ -336,6 +339,18 @@ struct Search {
                 offer(p, v > a ? v - a : a - v, -1, id, v > a ? '+' : 'r');
             }
         }
+        if (p == 0 && P.rootfull) {
+            // root only: every dictionary value (incl. 2-op values) as a factor: v = q*A + r / (q+1)*A - (A-r)
+            for (int i = 0; i < (int)d.e.size(); i++) {
+                u64 a = d.e[i].v;
+                if (a < 2 || a >= v || d.e[i].cost < 2) continue;  // cost<2 entries are handled below
+                u64 q = v / a, r = v % a;
+                if (!r) { offer(p, q, i, -1, '+'); continue; }
+                int rid = d.get(r);
+                if (rid >= 0) offer(p, q, i, rid, '+');
+                if (a - r <= d.L - v) { rid = d.get(a - r); if (rid >= 0) offer(p, q + 1, i, rid, '-'); }
+            }
+        }
         for (int i : d.low) {
             u64 a = d.e[i].v;
             if (a == 1) continue;
@@ -387,6 +402,27 @@ struct Search {
         if (d.bloom.on && d.bloom.has(target)) {
             char o; int x, y;
             if (d.decompose3(target, o, x, y)) { end = 0; term_kind = 3; best = 3; sols.push_back({3, 0, -1, 3}); return; }
+        }
+        if (d.bloom.on && P.mitm) {
+            // meet in the middle at the root: target = A (op) B, B from the dictionary, A in the S3 bloom
+            for (int i = 0; i < (int)d.e.size(); i++) {
+                const Expr &B = d.e[i];
+                int c = 1 + B.cost + 3;
+                if (c >= best) continue;
+                u64 bv = B.v, A[3]; char ops[3]; int na = 0;
+                if (target > bv) { A[na] = target - bv; ops[na++] = '+'; }       // t = A + B
+                if (target + bv <= d.L) { A[na] = target + bv; ops[na++] = '-'; } // t = A - B
+                if (bv > target) { A[na] = bv - target; ops[na++] = 'r'; }       // t = B - A
+                for (int q = 0; q < na; q++) {
+                    if (!d.bloom.has(A[q])) continue;
+                    char o; int x, y;
+                    if (!d.decompose3(A[q], o, x, y)) continue;
+                    sols.push_back({c, (int)history.size(), -1, 3});
+                    history.push_back({A[q], 1 + B.cost, 0, {-1, i, ops[q]}});
+                    if (c < best) { best = c; end = history.size() - 1; term_kind = 3; term = -1; }
+                    break;
+                }
+            }
         }
         vector<int> front{0};
         for (int depth = 0; depth < 24 && !front.empty(); depth++) {
@@ -456,6 +492,7 @@ struct Planner {
     }
     vector<int> palcost;  // virtual cost of each palette value (0 once built)
     void setup() {
+        palette.clear();
         if (!P.palette) return;
         if (P.palette == 2) {  // eager (legacy): build everything now, as free leaves
             palette.push_back(one());
@@ -477,11 +514,13 @@ struct Planner {
         return c;
     }
     vector<int> leaf_costs;
+    vector<u64> pref;  // preferred leaves (LNS neighbourhood)
     vector<u64> leaves() {
         vector<u64> lv; unordered_set<u64> used; leaf_costs.clear();
         auto add = [&](u64 v) { if (used.insert(v).second) { lv.push_back(v); leaf_costs.push_back(0); } };
         for (u64 v : palette) if (used.insert(v).second) { lv.push_back(v); leaf_costs.push_back(virtual_cost(v)); }
         for (u64 v : starts) add(v);
+        for (u64 v : pref) if ((int)lv.size() < P.n_leaves && have.count(v)) add(v);
         for (auto it = done.rbegin(); it != done.rend() && (int)lv.size() < P.n_done; ++it) add(*it);
         for (auto it = order.rbegin(); it != order.rend() && (int)lv.size() < P.n_leaves; ++it) add(*it);
         return lv;
@@ -671,8 +710,8 @@ static string verify_prog(u64 L, const vector<u64> &starts, const vector<u64> &t
     return "";
 }
 
-static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targets, const map<u64, Node> &defs,
-                             const vector<u64> &order, int *plan_size = nullptr) {
+static vector<Instr> compile_mode(const vector<u64> &starts, const vector<u64> &targets, const map<u64, Node> &defs,
+                             const vector<u64> &order, int *plan_size, bool planorder, bool seed_evict) {
     // keep the planner's creation order (a topological order), dropping values no target needs
     set<u64> need, startset(starts.begin(), starts.end());
     function<void(u64)> mark = [&](u64 v) {
@@ -682,7 +721,7 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
     };
     for (u64 t : targets) mark(t);
     vector<u64> seq;
-    if (getenv("ELF_PLANORDER")) { for (u64 v : order) if (need.count(v)) seq.push_back(v); }
+    if (planorder) { for (u64 v : order) if (need.count(v)) seq.push_back(v); }
     else {  // demand-driven: targets in planner order, each cone emitted depth-first just before use
         set<u64> placed(startset), tset(targets.begin(), targets.end());
         function<void(u64)> visit = [&](u64 v) {
@@ -732,7 +771,7 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
         return INF;
     };
     auto add_use = [&](u64 x, int t) {
-        if (seeds.count(x)) return;
+        if (seeds.count(x) && !seed_evict) return;
         auto &u = uses[x];
         auto it = lower_bound(u.begin(), u.end(), t, greater<int>());
         if (it != u.end() && *it == t) return;
@@ -741,12 +780,14 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
     auto inreg = [&](u64 x) -> int { for (int k = 0; k < 48; k++) if (occ[k] && bank[k] == x) return k; return -1; };
     // rebuild cost assuming only values with a future use (or seeds) survive in registers
     function<int(u64, int)> rcost = [&](u64 x, int depth) -> int {
-        if (inreg(x) >= 0 && (seeds.count(x) || nextuse(x, false) < INF)) return 0;
-        if (depth > 8 || !defs.count(x)) return 60;
+        int rx = inreg(x);
+        if (rx >= 0 && (seeds.count(x) || nextuse(x, false) < INF)) return 0;
+        if (!defs.count(x)) return rx >= 0 ? 0 : 1000;  // an evicted starting value cannot be rebuilt
+        if (depth > 8) return 60;
         const Node &m = defs.at(x);
         int c = 1 + rcost(m.a, depth + 1);
         if (m.b != m.a) c += rcost(m.b, depth + 1);
-        return min(c, 60);
+        return c >= 1000 ? 1000 : min(c, 60);
     };
     static const bool trace = getenv("ELF_TRACE") != nullptr;
     set<u64> built_once;
@@ -763,7 +804,7 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
         for (int k : {ra, rb}) {
             if (outer >> k & 1) continue;
             u64 old = bank[k];
-            if (!seeds.count(old) && nextuse(old, true) >= INF) { rd = k; break; }
+            if (nextuse(old, true) >= INF && (!seeds.count(old) || seed_evict)) { rd = k; break; }
         }
         if (rd < 0) for (int k = 0; k < 48; k++) if (!(locked >> k & 1) && !occ[k]) { rd = k; break; }
         if (rd < 0) {
@@ -771,8 +812,8 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
             for (int k = 0; k < 48; k++) {
                 if (locked >> k & 1) continue;
                 u64 old = bank[k];
-                if (seeds.count(old)) continue;
                 i64 nu = nextuse(old, false);
+                if (seeds.count(old) && (!seed_evict || nu < INF)) continue;
                 double sc;
                 if (nu >= INF) sc = 1e18;
                 else if (nu <= pos) sc = -1e17;  // needed right now
@@ -780,6 +821,7 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
                     u64 save = bank[k]; bank[k] = 0; occ[k] = false;
                     int rc = max(1, rcost(old, 0));
                     bank[k] = save; occ[k] = true;
+                    if (rc >= 1000) continue;
                     sc = double(nu - pos) / rc;
                 }
                 if (sc > bestsc) { bestsc = sc; rd = k; }
@@ -805,6 +847,23 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
     return prog;
 }
 
+static string verify_prog(u64 L, const vector<u64> &starts, const vector<u64> &targets, const vector<Instr> &prog);
+// try several schedules / seed policies, return the shortest program that verifies
+static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targets, const map<u64, Node> &defs,
+                             const vector<u64> &order, int *plan_size = nullptr, u64 L = 0) {
+    vector<Instr> best; bool have = false;
+    for (int mode = 0; mode < 4; mode++) {
+        bool po = mode & 1, se = mode & 2;
+        try {
+            auto p = compile_mode(starts, targets, defs, order, plan_size, po, se);
+            if (L && !verify_prog(L, starts, targets, p).empty()) continue;
+            if (!have || p.size() < best.size()) { best = p; have = true; }
+        } catch (exception &) {}
+    }
+    if (!have) throw runtime_error("compile failed");
+    return best;
+}
+
 // ---------------------------------------------------------------- driver
 struct PuzzleIn { string id; u64 L; vector<u64> s, t; };
 
@@ -817,8 +876,94 @@ static string to_json(const vector<Instr> &p) {
     return s + "]";
 }
 
+// parse a program JSON [["+",0,1,2],...] (no validation; verified later)
+static vector<Instr> parse_prog(const string &js) {
+    vector<Instr> p; size_t i = 0;
+    while ((i = js.find("[\"", i)) != string::npos) {
+        Instr in; in.op = js[i + 2];
+        i = js.find(',', i) + 1; in.i = atoi(js.c_str() + i);
+        i = js.find(',', i) + 1; in.j = atoi(js.c_str() + i);
+        i = js.find(',', i) + 1; in.d = atoi(js.c_str() + i);
+        p.push_back(in);
+    }
+    return p;
+}
+
+// LNS: remove a window of targets (with every value only they need), re-plan them, recompile.
+static vector<Instr> lns_improve(const PuzzleIn &pz, vector<Instr> best, Params P, Dict &d, double seconds, int *n_acc, int *iters) {
+    mt19937_64 rng(P.seed * 1000003ULL + std::hash<string>()(pz.id));
+    set<u64> tset(pz.t.begin(), pz.t.end()), sset(pz.s.begin(), pz.s.end());
+    // DAG of the current best program
+    auto to_dag = [&](const vector<Instr> &prog, map<u64, Node> &defs, vector<u64> &order) {
+        array<u64, 48> reg{}; set<u64> have(sset);
+        for (size_t k = 0; k < pz.s.size(); k++) reg[k] = pz.s[k];
+        for (auto &in : prog) {
+            u64 a = reg[in.i], b = reg[in.j], r;
+            if (in.op == '+') r = a + b; else if (in.op == '-') r = a - b; else if (in.op == '*') r = a * b; else r = a / b;
+            reg[in.d] = r;
+            if (!have.count(r)) { have.insert(r); defs[r] = {r, a, b, in.op}; order.push_back(r); }
+        }
+    };
+    map<u64, Node> cdefs; vector<u64> corder;
+    to_dag(best, cdefs, corder);
+    size_t bestlen = best.size();
+    if (getenv("ELF_RECOMPILE")) {
+        auto rp = compile(pz.s, pz.t, cdefs, corder, nullptr, pz.L);
+        fprintf(stderr, "RECOMPILE %s orig=%zu dag=%zu recompiled=%zu\n", pz.id.c_str(), best.size(), corder.size(), rp.size());
+    }
+    auto t0 = chrono::steady_clock::now();
+    int acc = 0, it = 0;
+    uniform_real_distribution<double> U(0, 1);
+    while (chrono::duration<double>(chrono::steady_clock::now() - t0).count() < seconds) {
+        it++;
+        // targets in production order
+        vector<u64> prod; for (u64 v : corder) if (tset.count(v)) prod.push_back(v);
+        if (prod.empty()) break;
+        int kmax = min<int>(P.lns_kmax, prod.size());
+        int k = 1 + rng() % kmax;
+        int st = rng() % (prod.size() - k + 1);
+        set<u64> S(prod.begin() + st, prod.begin() + st + k);
+        // keep everything the other targets need
+        set<u64> need;
+        function<void(u64)> mark = [&](u64 v) {
+            if (sset.count(v) || !need.insert(v).second) return;
+            const Node &n = cdefs.at(v); mark(n.a); mark(n.b);
+        };
+        for (u64 t : pz.t) if (!S.count(t) && !sset.count(t)) mark(t);
+        Planner pl(pz.L, pz.s, pz.t, P);
+        size_t wpos = 0, cnt = 0;
+        for (u64 v : corder) {
+            cnt++;
+            if (need.count(v)) { pl.have.insert(v); pl.defs[v] = cdefs.at(v); pl.order.push_back(v); }
+            if (v == *S.begin() || (S.count(v) && wpos == 0)) wpos = cnt;
+        }
+        // preferred leaves: kept values used by the removed cone, then by distance to the window
+        {
+            set<u64> pf;
+            for (u64 v : corder) if (!need.count(v)) { const Node &n = cdefs.at(v); for (u64 x : {n.a, n.b}) if (need.count(x) && pf.insert(x).second) pl.pref.push_back(x); }
+            vector<pair<long long, u64>> byd; long long idx = 0;
+            for (u64 v : corder) { idx++; if (need.count(v) && !pf.count(v)) byd.push_back({llabs(idx - (long long)wpos), v}); }
+            sort(byd.begin(), byd.end());
+            for (auto &q : byd) pl.pref.push_back(q.second);
+        }
+        if (P.noise <= 0) pl.P.noise = 0.5;
+        pl.rng.seed(rng());
+        try {
+            pl.solve(d);
+            auto prog = compile(pz.s, pz.t, pl.defs, pl.order, nullptr, pz.L);
+            if (prog.size() < bestlen && verify_prog(pz.L, pz.s, pz.t, prog).empty()) {
+                best = prog; bestlen = prog.size(); acc++;
+                cdefs.clear(); corder.clear(); to_dag(best, cdefs, corder);
+                if (P.verbose) fprintf(stderr, "  %s iter %d k=%d -> %zu\n", pz.id.c_str(), it, k, bestlen);
+            }
+        } catch (exception &) {}
+    }
+    *n_acc = acc; *iters = it;
+    return best;
+}
+
 int main(int argc, char **argv) {
-    Params P; string inpath;
+    Params P; string inpath, lnspath; double lns_sec = 10;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         auto nx = [&]() { return string(argv[++i]); };
@@ -840,7 +985,17 @@ int main(int argc, char **argv) {
         else if (a == "-lwidth") P.la_width = stoi(nx());
         else if (a == "-linc") P.la_inc = stoi(nx());
         else if (a == "-nd") P.n_done = stoi(nx());
+        else if (a == "-lns") lnspath = nx();
+        else if (a == "-lsec") lns_sec = stod(nx());
+        else if (a == "-lk") P.lns_kmax = stoi(nx());
+        else if (a == "-mitm") P.mitm = stoi(nx());
+        else if (a == "-rf") P.rootfull = stoi(nx());
         else inpath = a;
+    }
+    map<string, vector<Instr>> lnsin;
+    if (!lnspath.empty()) {
+        ifstream f(lnspath); string line;
+        while (getline(f, line)) { size_t sp = line.find(' '); if (sp == string::npos) continue; lnsin[line.substr(0, sp)] = parse_prog(line.substr(sp + 1)); }
     }
     vector<PuzzleIn> puzzles;
     {
@@ -864,11 +1019,26 @@ int main(int argc, char **argv) {
             auto &pz = puzzles[k];
             string res;
             try {
+                if (!lnspath.empty()) {
+                    if (!lnsin.count(pz.id)) continue;
+                    Params Q = P; Q.palette = 1;
+                    int acc = 0, iters = 0;
+                    auto &b0 = lnsin[pz.id];
+                    size_t L0 = b0.size();
+                    auto prog = lns_improve(pz, b0, Q, d, lns_sec, &acc, &iters);
+                    string why = verify_prog(pz.L, pz.s, pz.t, prog);
+                    if (!why.empty()) throw runtime_error("verify failed: " + why);
+                    res = pz.id + " " + to_string(prog.size()) + " " + to_json(prog);
+                    lock_guard<mutex> g(mu); total += prog.size();
+                    fprintf(stderr, "%s %zu -> %zu (acc %d / %d iters)\n", pz.id.c_str(), L0, prog.size(), acc, iters);
+                    out[k] = res;
+                    continue;
+                }
                 Planner pl(pz.L, pz.s, pz.t, P);
                 pl.solve(d);
                 if (P.verbose) fprintf(stderr, "  time build=%.2fs search=%.2fs dict=%zu n1=%d\n", pl.t_build, pl.t_search, d.e.size(), d.n1);
                 int psz = 0;
-                auto prog = compile(pz.s, pz.t, pl.defs, pl.order, &psz);
+                auto prog = compile(pz.s, pz.t, pl.defs, pl.order, &psz, pz.L);
                 string why = verify_prog(pz.L, pz.s, pz.t, prog);
                 if (!why.empty()) throw runtime_error("verify failed: " + why);
                 res = pz.id + " " + to_string(prog.size()) + " " + to_json(prog);
