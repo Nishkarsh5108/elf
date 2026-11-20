@@ -1,1 +1,13 @@
 data
+.claude
+.venv
+__pycache__/
+*.pyc
+kaggle.json
+*API*.txt
+scratch/
+out/
+ext/
+*.exe
+*.pdb
+*.obj
