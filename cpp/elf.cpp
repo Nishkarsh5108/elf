@@ -49,6 +49,7 @@ struct Params {
     int la_alts = 3;         // alternative solutions kept per target
     int la_slack = 1;        // solutions up to best+slack are kept
     int la_width = 4;        // beam width for the remaining-cost estimate
+    int la_inc = 1;          // evaluate lookahead candidates with an incremental dictionary
     int seed = 1;
     double noise = 0.0;      // random tie-break noise added to target costs
     int threads = 8;
@@ -82,6 +83,16 @@ struct Index {  // open addressing value -> id; interleaved slots; resizable bet
         u64 i = mix64(v) & mask;
         while (tab[i].key) { if (tab[i].key == v) return tab[i].id; i = (i + 1) & mask; }
         return -1;
+    }
+    // returns existing id, or -1 after inserting (v,id), or -2 if full
+    inline int find_or_insert(u64 v, int id) {
+        if (used.size() >= cap) { int g = get(v); return g >= 0 ? g : -2; }
+        u64 f = fpos(v);
+        bool maybe = filt[f >> 6] >> (f & 63) & 1;
+        u64 i = mix64(v) & mask;
+        if (maybe) while (tab[i].key) { if (tab[i].key == v) return tab[i].id; i = (i + 1) & mask; }
+        else while (tab[i].key) i = (i + 1) & mask;
+        tab[i] = {v, id}; used.push_back(i); filt[f >> 6] |= 1ULL << (f & 63); return -1;
     }
     inline bool insert(u64 v, int id) {
         if (used.size() >= cap) return false;
@@ -119,14 +130,74 @@ struct Dict {
     Index index;
     vector<Expr> e;
     int n0 = 0, n1 = 0, n2 = 0;
-    array<vector<pair<u64, int>>, 3> sorted;
+    static const int MAXC = 7;
+    array<vector<pair<u64, int>>, MAXC + 2> sorted;   // by cost; last bucket = incremental extras
+    vector<int> low, leaves_all, s1_all;               // ids of leaves and level-1 entries
+    vector<int> xs_ins;                                // incremental extras in insertion order
+    bool incremental = false;
+    struct Mark { size_t e, used, low, leaves, s1, xs, saved; };
+    vector<pair<int, Expr>> saved;   // entries promoted to leaves by add_leaves (restored on rollback)
+    Mark mark() const { return {e.size(), index.used.size(), low.size(), leaves_all.size(), s1_all.size(), xs_ins.size(), saved.size()}; }
+    void resort_extras() {
+        auto &x = sorted[MAXC + 1]; x.clear();
+        for (int id : xs_ins) x.emplace_back(e[id].v, id);
+        sort(x.begin(), x.end());
+    }
+    void add_leaves(const vector<u64> &vals) {
+        incremental = true;
+        size_t e0 = e.size();
+        vector<int> nl;
+        for (u64 v : vals) {
+            int id = get(v);
+            if (id >= 0) {
+                if (e[id].a < 0) continue;  // already a leaf
+                saved.push_back({id, e[id]});
+                e[id].a = -1; e[id].b = -1; e[id].op = 0; e[id].cost = 0;
+                nl.push_back(id);
+                continue;
+            }
+            size_t b = e.size(); add(v, -1, -1, 0, 0); if (e.size() > b) nl.push_back((int)b);
+        }
+        touched.clear();
+        for (size_t x = 0; x < nl.size(); x++) {
+            for (int j : leaves_all) combine(nl[x], j, 1);
+            for (size_t y = 0; y <= x; y++) combine(nl[x], nl[y], 1);
+        }
+        vector<int> news1 = touched;   // new or cheaper level-1 entries
+        for (int i : nl) { leaves_all.push_back(i); low.push_back(i); }
+        for (int k : news1) low.push_back(k);
+        touched.clear();
+        for (int k : news1) { for (int j : leaves_all) combine(k, j, 2); combine(k, k, 2); }
+        for (int k : s1_all) for (int j : nl) combine(k, j, 2);
+        for (int k : news1) s1_all.push_back(k);
+        for (int k : news1) xs_ins.push_back(k);
+        for (int k : touched) xs_ins.push_back(k);
+        for (int i : nl) xs_ins.push_back(i);
+        resort_extras();
+        incremental = false;
+    }
+    void rollback(const Mark &m) {
+        for (size_t k = m.used; k < index.used.size(); k++) index.tab[index.used[k]].key = 0;
+        index.used.resize(m.used);
+        while (saved.size() > m.saved) { auto &pr = saved.back(); if (pr.first < (int)m.e) e[pr.first] = pr.second; saved.pop_back(); }
+        e.resize(m.e); low.resize(m.low); leaves_all.resize(m.leaves); s1_all.resize(m.s1); xs_ins.resize(m.xs);
+        resort_extras();
+    }
     Bloom bloom;  // values of tree cost 3 (S2 op S0, S1 op S1)
     Dict() { index.init(20); }
     inline void add(u64 v, int a, int b, char op, int cost) {
-        if (v > 0 && v <= L && index.insert(v, (int)e.size())) e.push_back({v, a, b, op, (uint8_t)cost});
+        if (v == 0 || v > L || cost > MAXC) return;
+        int id = index.find_or_insert(v, (int)e.size());
+        if (id == -1) { e.push_back({v, a, b, op, (uint8_t)cost}); if (incremental) touched.push_back((int)e.size() - 1); }
+        else if (id >= 0 && cost < e[id].cost && e[id].a >= 0) {
+            if (incremental) { saved.push_back({id, e[id]}); touched.push_back(id); }
+            e[id] = {v, a, b, op, (uint8_t)cost};
+        }
     }
-    inline void combine(int i, int j, int cost) {
+    vector<int> touched;  // ids inserted or improved during an incremental phase
+    inline void combine(int i, int j, int /*level*/) {
         u64 a = e[i].v, b = e[j].v;
+        int cost = 1 + e[i].cost + (i == j ? 0 : e[j].cost);
         if (a + b <= L) add(a + b, i, j, '+', cost);
         if (a > b) add(a - b, i, j, '-', cost); else if (b > a) add(b - a, j, i, '-', cost);
         if ((u128)a * b <= L) add(a * b, i, j, '*', cost);
@@ -142,16 +213,17 @@ struct Dict {
         if (a != b && b % a == 0) out[n++] = b / a;
         return n;
     }
-    void build(const vector<u64> &leaves, u64 limit) {
+    void build(const vector<u64> &leaves, u64 limit) { build(leaves, vector<int>(leaves.size(), 0), limit); }
+    void build(const vector<u64> &leaves, const vector<int> &lcost, u64 limit) {
         L = limit;
         index.clear(); e.clear();
         {   // size the table for the expected dictionary
             size_t n = leaves.size(), est = n * n * 3 + n * n * n * 6 + 1024;
             if (est > (1ULL << 26)) est = 1ULL << 26;
-            index.ensure(max<size_t>(est / 4, 1 << 16));
+            index.ensure(max<size_t>(est / 2, 1 << 17));
         }
         for (auto &s : sorted) s.clear();
-        for (u64 v : leaves) add(v, -1, -1, 0, 0);
+        for (size_t k = 0; k < leaves.size(); k++) add(leaves[k], -1, -1, 0, lcost[k]);
         n0 = e.size();
         for (int i = 0; i < n0; i++) for (int j = 0; j <= i; j++) combine(i, j, 1);
         n1 = e.size();
@@ -160,6 +232,10 @@ struct Dict {
             combine(i, i, 2);
         }
         n2 = e.size();
+        low.clear(); leaves_all.clear(); s1_all.clear(); xs_ins.clear(); saved.clear();
+        for (int i = 0; i < n1; i++) low.push_back(i);
+        for (int i = 0; i < n0; i++) leaves_all.push_back(i);
+        for (int i = n0; i < n1; i++) s1_all.push_back(i);
         for (int i = 0; i < (int)e.size(); i++) sorted[e[i].cost].emplace_back(e[i].v, i);
         for (auto &s : sorted) sort(s.begin(), s.end());
         if (bloom.on) {
@@ -260,7 +336,7 @@ struct Search {
                 offer(p, v > a ? v - a : a - v, -1, id, v > a ? '+' : 'r');
             }
         }
-        for (int i = 0; i < d.n1; i++) {
+        for (int i : d.low) {
             u64 a = d.e[i].v;
             if (a == 1) continue;
             u64 diff = v > a ? v - a : a - v;
@@ -278,7 +354,7 @@ struct Search {
             int rid = d.get(r);
             if (rid >= 0) offer(p, q, i, rid, '+');
             if (a - r <= d.L - v) { rid = d.get(a - r); if (rid >= 0) offer(p, q + 1, i, rid, '-'); }
-            if (i < d.n0 && q > 64) {  // approximate the quotient by a dictionary value, then fix the error
+            if (d.e[i].a < 0 && q > 64) {  // approximate the quotient by a dictionary value, then fix the error
                 for (auto &arr : d.sorted) {
                     auto it = lower_bound(arr.begin(), arr.end(), make_pair(q, -1));
                     for (int k = -1; k <= 0; k++) {
@@ -348,6 +424,7 @@ struct Planner {
     u64 mat(const Dict &d, int id) {
         const Expr &e = d.e[id];
         if (have.count(e.v)) return e.v;
+        if (e.a < 0) return build_palette(e.v);
         u64 a = mat(d, e.a); u64 b = mat(d, e.b);
         return make(e.op, a, b);
     }
@@ -369,25 +446,41 @@ struct Planner {
         u64 r = power(k - k / 2), l = power(k / 2);
         return make('*', l, r);
     }
+    u64 build_palette(u64 v) {
+        if (have.count(v)) return v;
+        if (v == 1) return one();
+        if ((v & (v - 1)) == 0) return power(__builtin_ctzll(v));
+        if (v == 11 || v == 13 || v == 19 || v == 23) return make('+', build_palette(v - (v == 23 ? 16 : 8)), build_palette(v == 23 ? 16 : 8));
+        if ((v & (v + 1)) == 0 && v + 1 <= L) return make('-', build_palette(v + 1), one());
+        return binary(v);
+    }
+    vector<int> palcost;  // virtual cost of each palette value (0 once built)
     void setup() {
         if (!P.palette) return;
-        palette.push_back(one());
-        for (int k : {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 40, 48})
-            if ((1ULL << k) <= L) palette.push_back(power(k));
-        for (u64 i : {3, 5, 7, 9, 11, 13, 15, 17, 19, 23, 31})
-            if (i <= L) {
-                if (!have.count(i)) {
-                    if (i == 11 || i == 13 || i == 19 || i == 23) make('+', i - (i == 23 ? 16 : 8), i == 23 ? 16 : 8);
-                    else if ((i & (i + 1)) == 0 && i + 1 <= L) make('-', i + 1, one());
-                    else binary(i);
-                }
-                palette.push_back(i);
-            }
+        if (P.palette == 2) {  // eager (legacy): build everything now, as free leaves
+            palette.push_back(one());
+            for (int k : {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 40, 48})
+                if ((1ULL << k) <= L) palette.push_back(power(k));
+            for (u64 i : {3, 5, 7, 9, 11, 13, 15, 17, 19, 23, 31}) if (i <= L) palette.push_back(build_palette(i));
+            return;
+        }
+        palette.push_back(1);
+        for (int k : {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 40, 48}) if ((1ULL << k) <= L) palette.push_back(1ULL << k);
+        for (u64 i : {3, 5, 7, 9, 11, 13, 15, 17, 19, 23, 31}) if (i <= L) palette.push_back(i);
     }
+    int virtual_cost(u64 v) {
+        if (have.count(v)) return 0;
+        size_t n0 = order.size();
+        build_palette(v);
+        int c = order.size() - n0;
+        rollback(n0);
+        return c;
+    }
+    vector<int> leaf_costs;
     vector<u64> leaves() {
-        vector<u64> lv; unordered_set<u64> used;
-        auto add = [&](u64 v) { if (used.insert(v).second) lv.push_back(v); };
-        for (u64 v : palette) add(v);
+        vector<u64> lv; unordered_set<u64> used; leaf_costs.clear();
+        auto add = [&](u64 v) { if (used.insert(v).second) { lv.push_back(v); leaf_costs.push_back(0); } };
+        for (u64 v : palette) if (used.insert(v).second) { lv.push_back(v); leaf_costs.push_back(virtual_cost(v)); }
         for (u64 v : starts) add(v);
         for (auto it = done.rbegin(); it != done.rend() && (int)lv.size() < P.n_done; ++it) add(*it);
         for (auto it = order.rbegin(); it != order.rend() && (int)lv.size() < P.n_leaves; ++it) add(*it);
@@ -418,9 +511,24 @@ struct Planner {
         for (auto &n : nodes) if (!have.count(n.v)) { have.insert(n.v); defs[n.v] = n; order.push_back(n.v); }
     }
     // sum of best costs of the given targets from the current state (searching with width w)
+    double remaining_cost_inc(Dict &d, const vector<Node> &nodes, const vector<u64> &rem, int w) {
+        Params Q = P; Q.width = w;
+        auto m = d.mark();
+        vector<u64> vals; for (auto &n : nodes) vals.push_back(n.v);
+        d.add_leaves(vals);
+        Search s(d, Q);
+        double tot = 0;
+        for (u64 t : rem) {
+            if (have.count(t)) continue;
+            s.run(t);
+            tot += s.end < 0 ? 60 : s.best;
+        }
+        d.rollback(m);
+        return tot;
+    }
     double remaining_cost(Dict &d, const vector<u64> &rem, int w) {
         Params Q = P; Q.width = w;
-        d.build(leaves(), L);
+        { auto lv_ = leaves(); d.build(lv_, leaf_costs, L); }
         Search s(d, Q);
         double tot = 0;
         for (u64 t : rem) {
@@ -435,7 +543,7 @@ struct Planner {
         vector<u64> remaining;
         for (u64 t : targets) if (!have.count(t)) remaining.push_back(t); else done.insert(t);
         while (!remaining.empty()) {
-            d.build(leaves(), L);
+            { auto lv_ = leaves(); d.build(lv_, leaf_costs, L); }
             Search s(d, P); s.slack = P.la_slack;
             vector<Cand> cands;
             for (u64 t : remaining) {
@@ -463,12 +571,26 @@ struct Planner {
                 int bi = 0; double bs = 1e18;
                 if (K > 1) {
                     for (int k = 0; k < K; k++) {
-                        size_t n0 = order.size();
-                        apply(cands[k].nodes);
                         vector<u64> rest;
-                        for (u64 x : remaining) if (!have.count(x)) rest.push_back(x);
-                        double rc = remaining_cost(d, rest, P.la_width);
-                        rollback(n0);
+                        set<u64> made; for (auto &n : cands[k].nodes) made.insert(n.v);
+                        for (u64 x : remaining) if (!have.count(x) && !made.count(x)) rest.push_back(x);
+                        double rc;
+                        if (getenv("ELF_DBGINC")) {
+                            double r1 = remaining_cost_inc(d, cands[k].nodes, rest, P.la_width);
+                            size_t n0 = order.size();
+                            apply(cands[k].nodes);
+                            double r2 = remaining_cost(d, rest, P.la_width);
+                            rollback(n0);
+                            { auto lv_ = leaves(); d.build(lv_, leaf_costs, L); }
+                            fprintf(stderr, "DBGINC cand=%d inc=%.0f full=%.0f rest=%zu\n", k, r1, r2, rest.size());
+                            rc = r2;
+                        } else if (P.la_inc) rc = remaining_cost_inc(d, cands[k].nodes, rest, P.la_width);
+                        else {
+                            size_t n0 = order.size();
+                            apply(cands[k].nodes);
+                            rc = remaining_cost(d, rest, P.la_width);
+                            rollback(n0);
+                        }
                         double sc = cands[k].nodes.size() + P.la_weight * rc;
                         if (sc < bs) { bs = sc; bi = k; }
                     }
@@ -489,7 +611,7 @@ struct Planner {
         uniform_real_distribution<double> U(0, 1);
         while (!remaining.empty()) {
             auto tb = chrono::steady_clock::now();
-            d.build(leaves(), L);
+            { auto lv_ = leaves(); d.build(lv_, leaf_costs, L); }
             t_build += chrono::duration<double>(chrono::steady_clock::now() - tb).count();
             tb = chrono::steady_clock::now();
             Search s(d, P);
@@ -716,6 +838,7 @@ int main(int argc, char **argv) {
         else if (a == "-lalt") P.la_alts = stoi(nx());
         else if (a == "-lslack") P.la_slack = stoi(nx());
         else if (a == "-lwidth") P.la_width = stoi(nx());
+        else if (a == "-linc") P.la_inc = stoi(nx());
         else if (a == "-nd") P.n_done = stoi(nx());
         else inpath = a;
     }
