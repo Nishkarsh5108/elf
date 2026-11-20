@@ -584,8 +584,10 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
         }
         fprintf(stderr, "LIVESTAT maxlive=%d plan=%zu\n", mx, seq.size());
     }
-    // next-use lists
-    unordered_map<u64, vector<int>> uses;  // positions (descending order stored; back() = next)
+    // next-use lists: uses[x] sorted descending (back() = soonest); entries < pos are stale.
+    // Pseudo-uses are added for the arguments of an evicted live value (they will be needed to rebuild it).
+    const i64 INF = 1LL << 40;
+    unordered_map<u64, vector<int>> uses;
     for (int i = (int)seq.size() - 1; i >= 0; --i) {
         const Node &n = defs.at(seq[i]);
         uses[n.a].push_back(i);
@@ -598,63 +600,85 @@ static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targe
     for (size_t k = 0; k < starts.size(); k++) { bank[k] = starts[k]; occ[k] = true; }
     vector<Instr> prog;
     int pos = 0;
+    // first use >= pos (strict: > pos)
+    auto nextuse = [&](u64 x, bool strict) -> i64 {
+        auto it = uses.find(x);
+        if (it == uses.end()) return INF;
+        auto &u = it->second;
+        while (!u.empty() && u.back() < pos) u.pop_back();
+        for (int k = (int)u.size() - 1; k >= 0; k--) if (!strict || u[k] > pos) return u[k];
+        return INF;
+    };
+    auto add_use = [&](u64 x, int t) {
+        if (seeds.count(x)) return;
+        auto &u = uses[x];
+        auto it = lower_bound(u.begin(), u.end(), t, greater<int>());
+        if (it != u.end() && *it == t) return;
+        u.insert(it, t);
+    };
+    auto inreg = [&](u64 x) -> int { for (int k = 0; k < 48; k++) if (occ[k] && bank[k] == x) return k; return -1; };
+    // rebuild cost assuming only values with a future use (or seeds) survive in registers
+    function<int(u64, int)> rcost = [&](u64 x, int depth) -> int {
+        if (inreg(x) >= 0 && (seeds.count(x) || nextuse(x, false) < INF)) return 0;
+        if (depth > 8 || !defs.count(x)) return 60;
+        const Node &m = defs.at(x);
+        int c = 1 + rcost(m.a, depth + 1);
+        if (m.b != m.a) c += rcost(m.b, depth + 1);
+        return min(c, 60);
+    };
+    static const bool trace = getenv("ELF_TRACE") != nullptr;
+    set<u64> built_once;
     function<int(u64, u64)> emit = [&](u64 v, u64 locked) -> int {
-        for (int k = 0; k < 48; k++) if (occ[k] && bank[k] == v) return k;
+        int r0 = inreg(v);
+        if (r0 >= 0) return r0;
         const Node &n = defs.at(v);
         int ra = emit(n.a, locked);
         int rb = emit(n.b, locked | (1ULL << ra));
         u64 outer = locked;
         locked |= (1ULL << ra) | (1ULL << rb);
-        int rd = -1; i64 latest = -1;
+        int rd = -1;
         // a source register whose value dies here may receive the result (operands are read first)
         for (int k : {ra, rb}) {
             if (outer >> k & 1) continue;
             u64 old = bank[k];
-            auto it = uses.find(old);
-            bool dead = (it == uses.end() || it->second.empty()) && !seeds.count(old);
-            if (dead) { rd = k; latest = 1LL << 41; break; }
+            if (!seeds.count(old) && nextuse(old, true) >= INF) { rd = k; break; }
         }
-        // rebuild cost of a value given current registers (instructions), capped
-        function<int(u64, int)> rcost = [&](u64 x, int depth) -> int {
-            for (int k = 0; k < 48; k++) if (occ[k] && bank[k] == x) return 0;
-            if (depth > 6 || !defs.count(x)) return 50;
-            const Node &m = defs.at(x);
-            int c = 1 + rcost(m.a, depth + 1);
-            if (m.b != m.a) c += rcost(m.b, depth + 1);
-            return min(c, 50);
-        };
-        double bestsc = -1;
-        if (rd < 0) for (int k = 0; k < 48; k++) {
-            if (locked >> k & 1) continue;
-            if (!occ[k]) { rd = k; break; }
-            u64 old = bank[k];
-            auto it = uses.find(old);
-            i64 nu = (it == uses.end() || it->second.empty()) ? (1LL << 40) : it->second.back();
-            if (seeds.count(old)) continue;  // seeds cannot be rebuilt
-            double sc;
-            if (nu >= (1LL << 40)) sc = 1e18;
-            else {
-                bank[k] ^= 0x8000000000000000ULL;  // pretend evicted while costing its rebuild
-                int rc = max(1, rcost(old, 0));
-                bank[k] ^= 0x8000000000000000ULL;
-                sc = double(nu - pos) / rc;
+        if (rd < 0) for (int k = 0; k < 48; k++) if (!(locked >> k & 1) && !occ[k]) { rd = k; break; }
+        if (rd < 0) {
+            double bestsc = -1e18;
+            for (int k = 0; k < 48; k++) {
+                if (locked >> k & 1) continue;
+                u64 old = bank[k];
+                if (seeds.count(old)) continue;
+                i64 nu = nextuse(old, false);
+                double sc;
+                if (nu >= INF) sc = 1e18;
+                else if (nu <= pos) sc = -1e17;  // needed right now
+                else {
+                    u64 save = bank[k]; bank[k] = 0; occ[k] = false;
+                    int rc = max(1, rcost(old, 0));
+                    bank[k] = save; occ[k] = true;
+                    sc = double(nu - pos) / rc;
+                }
+                if (sc > bestsc) { bestsc = sc; rd = k; }
             }
-            if (sc > bestsc) { bestsc = sc; rd = k; }
+            if (rd < 0) throw runtime_error("no register");
+            u64 old = bank[rd];
+            i64 nu = nextuse(old, false);
+            if (nu < INF && defs.count(old)) {  // evicting a live value: its inputs will be needed to rebuild it
+                const Node &m = defs.at(old);
+                add_use(m.a, (int)nu); add_use(m.b, (int)nu);
+            }
         }
-        if (rd < 0) throw runtime_error("no register");
         prog.push_back({n.op, ra, rb, rd});
+        if (trace && !built_once.insert(v).second)
+            fprintf(stderr, "REBUILD pos=%d v=%llu\n", pos, (unsigned long long)v);
         bank[rd] = v; occ[rd] = true;
         return rd;
     };
     for (; pos < (int)seq.size(); pos++) {
         u64 v = seq[pos];
-        const Node &n = defs.at(v);
-        // consume this use
-        auto &ua = uses[n.a]; if (!ua.empty() && ua.back() == pos) ua.pop_back();
-        if (n.b != n.a) { auto &ub = uses[n.b]; if (!ub.empty() && ub.back() == pos) ub.pop_back(); }
-        bool present = false;
-        for (int k = 0; k < 48; k++) if (occ[k] && bank[k] == v) present = true;
-        if (!present) emit(v, 0);
+        if (inreg(v) < 0) emit(v, 0);
     }
     return prog;
 }
