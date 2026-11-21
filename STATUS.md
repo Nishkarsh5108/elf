@@ -3,8 +3,9 @@
 _Last updated: 2026-11-21_
 
 ## Current best
-* **Verified local best 133,772** (`out/public_merge.csv`, refreshed via E038 from 13 datasets + 7 notebook outputs; **LB 133,785** from E036 — saving daily submissions for solver wins below 133,772).
-* LB context (2026-11-21): leader 128,330 (ryan), 2nd 128,766, 3rd 128,830, top-10 ~130.4k, best public 133,772.
+* **Verified local & Kaggle LB score: 132,634** (`out/public_merge.csv`, Kaggle submission `ref=58662923`, rank **#237 / 2,093**, via E049 merge across 16 public datasets + 17 notebook outputs; `-1,151` below previous LB `133,785`).
+* LB context (2026-11-21 10:50 UTC): `#1` 127,200 (`ryan`), `#2` 127,514 (`Amin Ebrahimzadeh`), `#3` 128,300 (`c-number`), `#10` 129,996, `#50` 131,787, `#100` 132,321, `#200` 132,622, `#237` 132,634 (us).
+* Updated subsets on `out/public_merge.csv` (`132,634`): `bench12` = **2,287** (down from 2,303), `every10` (100 puzzles) = **12,131** (down from 12,256).
 
 ## Reproduce
 ```bash

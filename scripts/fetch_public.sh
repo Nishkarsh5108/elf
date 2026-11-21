@@ -10,20 +10,33 @@ for d in alexchilton/santa-2026-rudolph-programs \
          goodpjw2008/santa-2026-dag-lns-programs \
          rishabhbafnaiiitd/santa-2026-optimal-programs \
          konbu17/santa-2026-elf-calculator-programs \
-         royalacecat/santa-2026-replay-133780-lean \
+         royalacecat/santa-2026-replay-132638-lean \
          royalacecat/santa-2026-replay-133772-lean \
          kindasomethin/santa-2026-exact-portfolio-checkpoints \
          ozertuu/santa-2026-verified-programs \
          sacuscreed/santa-2026 \
          hanifnoerrofiq/santa-2026-elf-calculator-peephole-programs \
+         lucifer19/elf-calculator-x-ray-programs \
+         ishankarnick/santa-2026-frontier-programs \
+         pardheev/santa-2026-elf-calculator-132997 \
          coltondowning/the-elf-calculator-atlas \
          nevska/santa-2026-explorer-files "$@"; do
   n=$(echo "$d" | tr '/' '__'); rm -rf "ext/$n"; mkdir -p "ext/$n"; $K datasets download "$d" -p "ext/$n" --unzip -q || echo "failed $d"
 done
-for nb in royalacecat/santa-2026-public-frontier-score-133-772 \
-          goodpjw2008/santa-2026-lns-cp-sat-recombine-lb-133-778 \
+for nb in sacuscreed/public-merge \
+          mizeroluckygall/elf-calculator-best-of-public-merge-polish \
           asteriospanoras/santa-2026-best-public-score-a-gift-per-run \
+          goodpjw2008/santa-2026-lns-cp-sat-recombine-lb-132-636 \
+          royalacecat/santa-2026-public-frontier-score-132-638 \
           alexchilton/rudolph-the-red-nosed-register-allocator \
+          hanifnoerrofiq/santa-2026-elf-calculator-verified-portfolio \
+          lucifer19/santa-2026-the-elf-calculator-x-ray \
+          vigneshsankar1962/santa-2026-132k-sota-frontier-synthesis-portfolio \
+          vigneshsankar1962/santa-2026-free-order-cp-sat-dag-optimizer \
+          ishankarnick/santa-2026-frontier-programs-132-678 \
+          lynnsakurai/santa-gauss-and-the-r-a-a-p \
+          wangjakie/santa-2026-gpu-recipe-fusion-and-dag-search \
+          pardheev/132-715-best-public-score-santa-2026 \
           amanatar/santa-2026-fast-validator-eda-sota-baseline \
           kindasomethin/santa-2026-exact-portfolio-frontier-133813 \
           kmmmvs/santa-2026-verified-best-of-merge; do
