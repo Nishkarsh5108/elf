@@ -68,6 +68,10 @@ struct Params {
     int verbose = 0;
     string lns_path;
     string sa_path;
+    string macro_path;
+    string macro_pool_path;
+    int min_len = 0;
+    int max_len = 9999;
     string out_path;
     string pool_path;
     string dag_path;
@@ -5097,6 +5101,716 @@ static int run_dag_mode(const vector<PuzzleIn> &puzzles, const Params &P) {
     return 0;
 }
 
+// ---------------------------------------------------------------- Mode 5: Macro-Subprogram SA + Re-Plan
+static vector<u64> discover_cf_and_gcd_bases(u64 L, const vector<u64> &targets_sub,
+                                             const unordered_set<u64> &have,
+                                             const unordered_set<u64> &banned_vals) {
+    vector<u64> st;
+    for (u64 t : targets_sub) if (!have.count(t) && t >= 256) st.push_back(t);
+    sort(st.begin(), st.end());
+    st.erase(unique(st.begin(), st.end()), st.end());
+    if (st.size() < 2) return {};
+
+    vector<u64> cand_g;
+    int n20 = min(20, (int)st.size());
+    int n10 = min(10, (int)st.size());
+    // 1. Pairwise exact + small-offset GCDs
+    for (int i = 0; i < n20; i++) {
+        for (int j = i + 1; j < n20; j++) {
+            u64 g = bgcd(st[i], st[j]);
+            if (g >= 64 && g <= L / 100) cand_g.push_back(g);
+        }
+    }
+    for (int i = 0; i < n10; i++) {
+        for (int j = i + 1; j < n10; j++) {
+            for (int da = -8; da <= 8; da++) {
+                if ((i64)st[i] + da <= 0) continue;
+                u64 va = (u64)((i64)st[i] + da);
+                for (int db = -8; db <= 8; db++) {
+                    if ((i64)st[j] + db <= 0) continue;
+                    u64 g = bgcd(va, (u64)((i64)st[j] + db));
+                    if (g >= 128 && g <= L / 100) cand_g.push_back(g);
+                }
+            }
+        }
+    }
+    // 2. Continued-fraction convergents h/k of T_j / T_i (k <= 4096)
+    for (int i = 0; i < n20; i++) {
+        for (int j = i + 1; j < n20; j++) {
+            u64 p = st[j], q = st[i], h0 = 0, h1 = 1, k0 = 1, k1 = 0;
+            for (int step = 0; step < 32 && q > 0; step++) {
+                u64 a = p / q, r = p % q;
+                p = q; q = r;
+                u128 nh = (u128)a * h1 + h0, nk = (u128)a * k1 + k0;
+                if (nh > 4096 || nk > 4096) break;
+                h0 = h1; h1 = (u64)nh;
+                k0 = k1; k1 = (u64)nk;
+                if (k1 >= 2) {
+                    u64 B = (st[i] + k1 / 2) / k1;
+                    if (B >= 128 && B <= L / 4) cand_g.push_back(B);
+                }
+            }
+        }
+    }
+    sort(cand_g.begin(), cand_g.end());
+    cand_g.erase(unique(cand_g.begin(), cand_g.end()), cand_g.end());
+
+    struct RankedBase { double sc; u64 b; };
+    vector<RankedBase> ranked;
+    for (u64 B : cand_g) {
+        if (have.count(B) || banned_vals.count(B)) continue;
+        int hits = 0;
+        u64 tol = max<u64>(64, B >> 12);
+        for (u64 t : st) {
+            u64 q = (t + B / 2) / B;
+            if (q >= 1 && q <= 4096) {
+                u128 qb = (u128)q * B;
+                u64 r = (u64)(t >= qb ? (u128)t - qb : qb - (u128)t);
+                if (r <= tol) hits++;
+            }
+        }
+        if (hits >= 3) ranked.push_back({(double)hits * log2((double)B), B});
+    }
+    sort(ranked.begin(), ranked.end(), [](const RankedBase &a, const RankedBase &b) { return a.sc > b.sc; });
+    vector<u64> out;
+    for (size_t i = 0; i < ranked.size() && out.size() < 4; i++) out.push_back(ranked[i].b);
+    // Add pairwise products of top 4 bases if within L
+    size_t nbase = out.size();
+    for (size_t i = 0; i < nbase && out.size() < 4; i++) {
+        for (size_t j = i + 1; j < nbase && out.size() < 4; j++) {
+            u128 pr = (u128)out[i] * out[j];
+            if (pr <= (u128)L && !have.count((u64)pr) && !banned_vals.count((u64)pr)) {
+                out.push_back((u64)pr);
+            }
+        }
+    }
+    return out;
+}
+
+static bool construct_subprogram(
+    u64 L, const vector<u64> &starts, const vector<u64> &all_targets,
+    const unordered_set<u64> &init_have, const vector<u64> &init_built,
+    const map<u64, Step> &init_defs, const vector<u64> &init_order,
+    const unordered_map<u64, int> &init_fanout,
+    const unordered_set<u64> &banned_vals,
+    const Params &P, mt19937_64 &rng, SearchStats &stats,
+    double la_weight_override, double jitter, int max_dag_budget,
+    map<u64, Step> &out_defs, vector<u64> &out_order, int &out_dag_len) {
+
+    unordered_set<u64> have = init_have;
+    vector<u64> built = init_built;
+    map<u64, Step> defs = init_defs;
+    vector<u64> order = init_order;
+    unordered_map<u64, int> fanout = init_fanout;
+    unordered_map<u64, int> def_pos;
+    for (size_t i = 0; i < order.size(); i++) def_pos[order[i]] = (int)i;
+    unordered_set<u64> tset(all_targets.begin(), all_targets.end());
+    unordered_set<u64> near_vals;
+
+    vector<u64> remaining;
+    for (u64 t : all_targets) if (!have.count(t)) remaining.push_back(t);
+    if (remaining.empty()) {
+        Dag td;
+        td.init(L, starts, all_targets);
+        if (!td.from_defs(defs, order)) return false;
+        out_defs = move(defs); out_order = move(order);
+        out_dag_len = (int)td.nodes.size() - td.ks;
+        return true;
+    }
+
+    vector<u64> bonus_hubs = discover_cf_and_gcd_bases(L, remaining, have, banned_vals);
+    for (u64 bh : bonus_hubs) near_vals.insert(bh);
+
+    PoolDict dict;
+    DeepSearch ds(dict, P, rng);
+
+    auto apply_steps = [&](const vector<Step> &steps) {
+        for (const auto &s : steps) {
+            if (!have.count(s.r)) {
+                u64 chk = 0;
+                if (!have.count(s.a) || !have.count(s.b) || !apply_op(s.op, s.a, s.b, L, chk) || chk != s.r) continue;
+                have.insert(s.r);
+                built.push_back(s.r);
+                defs[s.r] = s;
+                order.push_back(s.r);
+                def_pos[s.r] = (int)order.size() - 1;
+                fanout[s.a]++;
+                if (s.b != s.a) fanout[s.b]++;
+            }
+        }
+    };
+
+    function<u64(u64)> build_binary = [&](u64 v) -> u64 {
+        if (have.count(v)) return v;
+        if (v == 1) {
+            u64 s0 = starts[0];
+            apply_steps({{'/', s0, s0, 1}});
+            return 1;
+        }
+        u64 h = build_binary(v / 2);
+        apply_steps({{'+', h, h, 2 * h}});
+        if (v % 2) {
+            u64 one = build_binary(1);
+            apply_steps({{'+', 2 * h, one, v}});
+        }
+        return v;
+    };
+
+    bool boot_ladder_used = !init_order.empty();
+    int hub_commits = 0, consec_hub = 0;
+    unordered_set<u64> sset_c(starts.begin(), starts.end());
+
+    while (!remaining.empty()) {
+        if ((int)order.size() + (int)remaining.size() > max_dag_budget) return false;
+        ds.deep_beam = (remaining.size() <= 1);
+
+        vector<u64> leaves, done_t;
+        vector<int> lcosts;
+        int s1_cnt = 0;
+        double tb = now_sec();
+        select_leaves(L, starts, built, tset, fanout, near_vals, P.n_leaves, leaves, lcosts, s1_cnt, done_t, true);
+        dict.build(L, starts, built, leaves, lcosts, s1_cnt, done_t, P.s2_leaves, P.s2_cap);
+        stats.sec[0] += now_sec() - tb;
+
+        struct PlanCand { u64 target; int cost; int eng; vector<Step> steps; };
+        vector<PlanCand> cands;
+        int min_fast = 1 << 20;
+        for (u64 t : remaining) {
+            auto sols = ds.search(t, 10, P.la_alts, 2, stats, 1);
+            for (auto &s : sols) {
+                min_fast = min(min_fast, s.cost);
+                cands.push_back({t, s.cost, s.engine, move(s.steps)});
+            }
+        }
+        if (min_fast > 5) {
+            for (size_t i = 0; i < remaining.size() && (i < 16 || cands.empty()); i++) {
+                auto sols = ds.search(remaining[i], 28, P.la_alts, 2, stats, 2);
+                for (auto &s : sols) cands.push_back({remaining[i], s.cost, s.engine, move(s.steps)});
+            }
+        }
+
+        if (cands.empty()) {
+            u64 t_min = *min_element(remaining.begin(), remaining.end());
+            auto boot = ds.search(t_min, 36, 1, 0, stats, 3);
+            if (!boot.empty()) {
+                apply_steps(boot[0].steps);
+            } else if (!boot_ladder_used && !starts.empty()) {
+                boot_ladder_used = true;
+                size_t before = order.size();
+                u64 s0 = starts[0];
+                if (!have.count(1)) apply_steps({{'/', s0, s0, 1}});
+                vector<u64> pws{1, 2, 4, 16, 256, 65536};
+                if (!have.count(2) && 2 <= L) apply_steps({{'+', 1, 1, 2}});
+                for (size_t pi = 2; pi < pws.size(); pi++) {
+                    u64 prev = pws[pi - 1];
+                    if (have.count(prev) && (u128)prev * prev <= (u128)L) {
+                        apply_steps({{'*', prev, prev, prev * prev}});
+                    }
+                }
+                if (starts.size() >= 2 && (u128)starts[0] * starts[1] <= (u128)L) {
+                    apply_steps({{'*', starts[0], starts[1], starts[0] * starts[1]}});
+                }
+                if (order.size() == before) build_binary(t_min);
+            } else {
+                build_binary(t_min);
+            }
+            consec_hub = 0;
+        } else {
+            vector<PlanCand> hub_cands;
+            if (hub_commits < 6 && consec_hub < 3 && remaining.size() >= 2) {
+                unordered_map<u64, unordered_set<u64>> mid_targets;
+                for (const auto &c : cands) {
+                    if (c.target == 0) continue;
+                    for (const auto &st : c.steps) {
+                        if (st.r != c.target && !have.count(st.r) && !banned_vals.count(st.r))
+                            mid_targets[st.r].insert(c.target);
+                    }
+                }
+                vector<pair<int, u64>> mranked;
+                for (const auto &[hv, ts_set] : mid_targets) {
+                    if (ts_set.size() >= 2) mranked.emplace_back((int)ts_set.size(), hv);
+                }
+                sort(mranked.rbegin(), mranked.rend());
+                unordered_set<u64> picked_hubs;
+                for (size_t hi = 0; hi < mranked.size() && hub_cands.size() < 3; hi++) {
+                    u64 hv = mranked[hi].second;
+                    if (!picked_hubs.insert(hv).second) continue;
+                    vector<Step> best_pref;
+                    for (const auto &c : cands) {
+                        for (size_t j = 0; j < c.steps.size(); j++) {
+                            if (c.steps[j].r == hv) {
+                                unordered_set<u64> need{hv};
+                                vector<Step> clean;
+                                for (int q = (int)j; q >= 0; --q) {
+                                    if (need.count(c.steps[q].r)) {
+                                        clean.push_back(c.steps[q]);
+                                        need.insert(c.steps[q].a);
+                                        need.insert(c.steps[q].b);
+                                    }
+                                }
+                                reverse(clean.begin(), clean.end());
+                                if (!clean.empty() && clean.size() <= 4 &&
+                                    (best_pref.empty() || clean.size() < best_pref.size())) {
+                                    best_pref = move(clean);
+                                }
+                            }
+                        }
+                    }
+                    if (!best_pref.empty()) hub_cands.push_back({0, (int)best_pref.size(), 5, move(best_pref)});
+                }
+                for (u64 bh : bonus_hubs) {
+                    if (have.count(bh) || picked_hubs.count(bh) || banned_vals.count(bh)) continue;
+                    auto sols = ds.search(bh, 14, 1, 0, stats, 2);
+                    if (!sols.empty()) {
+                        picked_hubs.insert(bh);
+                        hub_cands.push_back({0, sols[0].cost, sols[0].engine, move(sols[0].steps)});
+                    }
+                }
+            }
+
+            stable_sort(cands.begin(), cands.end(), [](const PlanCand &a, const PlanCand &b) {
+                return a.cost < b.cost;
+            });
+            if ((int)cands.size() > P.lookahead) cands.resize(P.lookahead);
+            for (auto &hc : hub_cands) cands.push_back(move(hc));
+
+            int K = (int)cands.size();
+            int bi = 0;
+            double bs = 1e18;
+            if (K > 1 && (remaining.size() > 1 || K <= 6)) {
+                int cur_ord_n = (int)order.size();
+                for (int k = 0; k < K; k++) {
+                    vector<u64> add_v;
+                    unordered_set<u64> made;
+                    int ban_hits = 0;
+                    for (const auto &st : cands[k].steps) {
+                        add_v.push_back(st.r);
+                        made.insert(st.r);
+                        if (banned_vals.count(st.r)) ban_hits++;
+                    }
+                    int old_reuses = 0;
+                    for (const auto &st : cands[k].steps) {
+                        for (u64 opv : {st.a, st.b}) {
+                            if (sset_c.count(opv) || made.count(opv)) continue;
+                            auto it_dp = def_pos.find(opv);
+                            if (it_dp != def_pos.end() && cur_ord_n - it_dp->second > 42 && fanout[opv] <= 2) {
+                                old_reuses++;
+                            }
+                        }
+                    }
+                    auto mk = dict.mark();
+                    dict.add_leaves_inc(add_v);
+                    ds.extra_pool = made;
+                    double rem_est = 0.0;
+                    for (u64 x : remaining) {
+                        if (have.count(x) || made.count(x)) continue;
+                        rem_est += ds.estimate_cost(x);
+                    }
+                    ds.extra_pool.clear();
+                    dict.rollback(mk);
+                    double sc = (double)cands[k].cost + la_weight_override * rem_est
+                                + 0.25 * (double)old_reuses + 3.5 * (double)ban_hits;
+                    if (jitter > 0.0) sc += jitter * ((double)(rng() % 1000) / 1000.0);
+                    if (sc < bs) { bs = sc; bi = k; }
+                }
+            }
+            bool is_hub = (cands[bi].target == 0);
+            if (is_hub) { hub_commits++; consec_hub++; }
+            else consec_hub = 0;
+            apply_steps(cands[bi].steps);
+        }
+
+        vector<u64> rem2;
+        for (u64 t : remaining) if (!have.count(t)) rem2.push_back(t);
+        remaining.swap(rem2);
+    }
+
+    Dag td;
+    td.init(L, starts, all_targets);
+    if (!td.from_defs(defs, order)) return false;
+    out_defs = move(defs);
+    out_order = move(order);
+    out_dag_len = (int)td.nodes.size() - td.ks;
+    return true;
+}
+
+struct MacroResult {
+    vector<Instr> prog;
+    vector<vector<Instr>> archive;
+    int iters = 0;
+    int dag_wins = 0;
+    int cmp_wins = 0;
+    int spill_drops = 0;
+    int best_delta = 9999;
+    SearchStats stats;
+};
+
+static MacroResult macro_optimize(u64 L, const vector<u64> &starts, const vector<u64> &all_targets,
+                                  const vector<Instr> &init_prog, const Params &P, mt19937_64 &rng) {
+    MacroResult res;
+    res.prog = init_prog;
+    Dag best_dag, cur_dag;
+    best_dag.init(L, starts, all_targets);
+    if (!best_dag.from_prog(init_prog)) {
+        res.archive.push_back(init_prog);
+        return res;
+    }
+    best_dag.analyse();
+    cur_dag = best_dag;
+    vector<u64> best_ord = extract_prog_order(starts, init_prog);
+    vector<u64> cur_ord = best_ord;
+
+    auto dag_sig = [](const Dag &dg) -> u64 {
+        vector<u64> hs;
+        hs.reserve(dg.nodes.size() - dg.ks);
+        for (int u = dg.ks; u < (int)dg.nodes.size(); u++) {
+            u64 va = dg.nodes[dg.nodes[u].a].v, vb = dg.nodes[dg.nodes[u].b].v;
+            if ((dg.nodes[u].op == '+' || dg.nodes[u].op == '*') && va > vb) swap(va, vb);
+            u64 z = mix64(dg.nodes[u].v ^ ((u64)(unsigned char)dg.nodes[u].op << 56));
+            z ^= mix64(va * 0x9e3779b97f4a7c15ULL + 17ULL) ^ mix64(vb * 0xbf58476d1ce4e5b9ULL + 31ULL);
+            hs.push_back(z);
+        }
+        sort(hs.begin(), hs.end());
+        u64 h = dg.nodes.size() - dg.ks;
+        for (u64 x : hs) h = mix64(h ^ x);
+        return h;
+    };
+
+    unordered_set<u64> arch_sigs;
+    res.archive.push_back(init_prog);
+    arch_sigs.insert(dag_sig(best_dag));
+
+    struct HelperCluster {
+        int u_idx;
+        u64 u_val;
+        vector<int> dep_t; // indices into cur_dag.targets
+        int freed_ops;
+    };
+    vector<HelperCluster> clusters;
+    vector<vector<int>> target_desc_t; // per target ti: all targets tj that depend on ti (incl ti)
+
+    auto rebuild_clusters = [&]() {
+        clusters.clear();
+        int n = (int)cur_dag.nodes.size();
+        int nt = (int)cur_dag.targets.size();
+        unordered_map<int, int> node2ti;
+        for (int ti = 0; ti < nt; ti++) node2ti[cur_dag.tnode[ti]] = ti;
+
+        auto get_desc_targets = [&](int start_u) -> vector<int> {
+            vector<char> vis(n, 0);
+            vector<int> st = {start_u}, out_t;
+            while (!st.empty()) {
+                int x = st.back(); st.pop_back();
+                if (vis[x]) continue;
+                vis[x] = 1;
+                auto it = node2ti.find(x);
+                if (it != node2ti.end()) out_t.push_back(it->second);
+                for (int w : cur_dag.users[x]) st.push_back(w);
+            }
+            sort(out_t.begin(), out_t.end());
+            return out_t;
+        };
+
+        target_desc_t.assign(nt, {});
+        for (int ti = 0; ti < nt; ti++) target_desc_t[ti] = get_desc_targets(cur_dag.tnode[ti]);
+
+        for (int u = cur_dag.ks; u < n; u++) {
+            vector<int> dt = get_desc_targets(u);
+            if ((int)dt.size() < 2 || (int)dt.size() > 16) continue;
+            vector<char> is_dep(nt, 0);
+            for (int ti : dt) is_dep[ti] = 1;
+            vector<char> anc(n, 0);
+            vector<int> st;
+            for (int s = 0; s < cur_dag.ks; s++) anc[s] = 1;
+            for (int ti = 0; ti < nt; ti++) if (!is_dep[ti]) st.push_back(cur_dag.tnode[ti]);
+            while (!st.empty()) {
+                int x = st.back(); st.pop_back();
+                if (anc[x]) continue;
+                anc[x] = 1;
+                if (x >= cur_dag.ks) {
+                    st.push_back(cur_dag.nodes[x].a);
+                    st.push_back(cur_dag.nodes[x].b);
+                }
+            }
+            int anc_cnt = 0;
+            for (int x = cur_dag.ks; x < n; x++) if (anc[x]) anc_cnt++;
+            int freed = (n - cur_dag.ks) - anc_cnt;
+            if (freed >= 4) clusters.push_back({u, cur_dag.nodes[u].v, move(dt), freed});
+        }
+    };
+    rebuild_clusters();
+
+    int nt = (int)best_dag.targets.size();
+    if (nt <= 1) return res;
+
+    double t0 = now_sec(), deadline = t0 + max(0.5, P.lns_sec);
+    int stall = 0;
+    static const double la_ws[4] = {0.30, 0.45, 0.65, 0.85};
+    static const double jits[4] = {0.0, 0.20, 0.50, 0.90};
+
+    while (now_sec() < deadline) {
+        int cur_dag_len = (int)cur_dag.nodes.size() - cur_dag.ks;
+        int best_dag_len = (int)best_dag.nodes.size() - best_dag.ks;
+        int n = (int)cur_dag.nodes.size();
+
+        int roll = (int)(rng() % 100);
+        int mv = (roll < 55 && !clusters.empty()) ? 1 : ((roll < 85 || cur_dag_len > 135) ? 2 : 3);
+        if (nt <= 3 && cur_dag_len <= 135 && roll >= 55) mv = 3;
+
+        vector<char> rem_t(nt, 0);
+        unordered_set<u64> banned;
+        if (mv == 1) {
+            const auto &cl = clusters[rng() % clusters.size()];
+            for (int ti : cl.dep_t) rem_t[ti] = 1;
+            banned.insert(cl.u_val);
+            if (rng() % 2 == 0) {
+                int ca = cur_dag.nodes[cl.u_idx].a, cb = cur_dag.nodes[cl.u_idx].b;
+                if (ca >= cur_dag.ks) banned.insert(cur_dag.nodes[ca].v);
+                if (cb >= cur_dag.ks) banned.insert(cur_dag.nodes[cb].v);
+            }
+        } else if (mv == 2) {
+            int k = 3 + (int)(rng() % min(12, max(1, nt - 3)));
+            vector<int> seeds;
+            int mode2 = (int)(rng() % 3);
+            if (mode2 == 0) {
+                // Contiguous window along cur_ord
+                vector<pair<int, int>> ord_t;
+                for (int ti = 0; ti < nt; ti++) ord_t.emplace_back(cur_dag.tnode[ti], ti);
+                sort(ord_t.begin(), ord_t.end());
+                int st = (int)(rng() % max(1, nt - k + 1));
+                for (int j = 0; j < k && st + j < nt; j++) seeds.push_back(ord_t[st + j].second);
+            } else {
+                vector<int> perm(nt);
+                iota(perm.begin(), perm.end(), 0);
+                shuffle(perm.begin(), perm.end(), rng);
+                for (int j = 0; j < k && j < nt; j++) seeds.push_back(perm[j]);
+            }
+            for (int ti : seeds) {
+                if ((int)target_desc_t[ti].size() <= 14) {
+                    for (int dt : target_desc_t[ti]) rem_t[dt] = 1;
+                }
+            }
+            int cnt_r = 0;
+            for (int ti = 0; ti < nt; ti++) if (rem_t[ti]) cnt_r++;
+            if (cnt_r == 0 || cnt_r >= nt) {
+                for (int ti = 0; ti < nt; ti++) rem_t[ti] = 0;
+                int picked = 0;
+                for (int ti = nt - 1; ti >= 0 && picked < min(nt - 1, 6); ti--) {
+                    if ((int)target_desc_t[ti].size() == 1) { rem_t[ti] = 1; picked++; }
+                }
+                if (picked == 0) continue;
+            }
+        } else {
+            for (int ti = 0; ti < nt; ti++) rem_t[ti] = 1;
+            if (rng() % 2 == 0) {
+                vector<pair<int, u64>> shs;
+                for (int u = cur_dag.ks; u < n; u++)
+                    if ((int)cur_dag.users[u].size() >= 3) shs.emplace_back((int)cur_dag.users[u].size(), cur_dag.nodes[u].v);
+                sort(shs.rbegin(), shs.rend());
+                for (size_t i = 0; i < shs.size() && i < 2; i++) banned.insert(shs[i].second);
+            }
+        }
+
+        // Compute G_rest = Anc(T \ T_rem) preserving cur_ord
+        vector<char> keep(n, 0);
+        vector<int> st;
+        for (int s = 0; s < cur_dag.ks; s++) keep[s] = 1;
+        for (int ti = 0; ti < nt; ti++) if (!rem_t[ti]) st.push_back(cur_dag.tnode[ti]);
+        while (!st.empty()) {
+            int x = st.back(); st.pop_back();
+            if (keep[x]) continue;
+            keep[x] = 1;
+            if (x >= cur_dag.ks) {
+                st.push_back(cur_dag.nodes[x].a);
+                st.push_back(cur_dag.nodes[x].b);
+            }
+        }
+        if (mv == 2 && (rng() % 2 == 0)) {
+            for (int u = cur_dag.ks; u < n; u++) {
+                if (!keep[u] && cur_dag.users[u].size() >= 2) banned.insert(cur_dag.nodes[u].v);
+            }
+        }
+
+        unordered_set<u64> init_have(starts.begin(), starts.end());
+        vector<u64> init_built(starts.begin(), starts.end());
+        map<u64, Step> init_defs;
+        vector<u64> init_order;
+        unordered_map<u64, int> init_fanout;
+        for (int u = cur_dag.ks; u < n; u++) {
+            if (!keep[u]) continue;
+            u64 v = cur_dag.nodes[u].v, va = cur_dag.nodes[cur_dag.nodes[u].a].v, vb = cur_dag.nodes[cur_dag.nodes[u].b].v;
+            init_have.insert(v);
+            init_built.push_back(v);
+            init_defs[v] = {cur_dag.nodes[u].op, va, vb, v};
+            init_order.push_back(v);
+            init_fanout[va]++;
+            if (vb != va) init_fanout[vb]++;
+        }
+
+        int n_trials = 1;
+        for (int tr = 0; tr < n_trials && now_sec() < deadline; tr++) {
+            res.iters++;
+            double law = la_ws[(res.iters + tr) % 4];
+            double jit = jits[(rng() >> 3) % 4];
+            map<u64, Step> out_defs;
+            vector<u64> out_ord;
+            int new_dag_len = 0;
+            bool ok = construct_subprogram(L, starts, all_targets, init_have, init_built, init_defs,
+                                           init_order, init_fanout, banned, P, rng, res.stats,
+                                           law, jit, best_dag_len + 4, out_defs, out_ord, new_dag_len);
+            if (!ok) continue;
+
+            res.best_delta = min(res.best_delta, new_dag_len - best_dag_len);
+            Dag td;
+            td.init(L, starts, all_targets);
+            if (!td.from_defs(out_defs, out_ord)) continue;
+            td.analyse();
+            u64 sig = dag_sig(td);
+
+            if (tr == 0 && new_dag_len <= best_dag_len + 3) n_trials = 2;
+
+            if (new_dag_len < best_dag_len) {
+                res.dag_wins++;
+                vector<Instr> nprog;
+                if (td.compile(nprog, max(P.reorder_tries, 64), rng, &best_ord, nullptr, 15000) &&
+                    verify_prog(L, starts, all_targets, nprog).empty() &&
+                    nprog.size() < res.prog.size()) {
+                    res.cmp_wins++;
+                    res.prog = move(nprog);
+                    best_dag = td;
+                    best_ord = extract_prog_order(starts, res.prog);
+                    cur_dag = td;
+                    cur_ord = best_ord;
+                    rebuild_clusters();
+                    stall = 0;
+                    if (arch_sigs.insert(sig).second && res.archive.size() < 16)
+                        res.archive.push_back(res.prog);
+                    break;
+                } else {
+                    res.spill_drops++;
+                }
+            } else if (new_dag_len <= best_dag_len + 2 && res.archive.size() < 16 && !arch_sigs.count(sig)) {
+                vector<Instr> nprog;
+                if (td.compile(nprog, 16, rng, &cur_ord, nullptr, 3000) &&
+                    (int)nprog.size() <= (int)res.prog.size() + 2 &&
+                    verify_prog(L, starts, all_targets, nprog).empty()) {
+                    arch_sigs.insert(sig);
+                    res.archive.push_back(move(nprog));
+                }
+            }
+
+            // Macro-SA state transition
+            double prog_frac = min(1.0, (now_sec() - t0) / max(0.5, P.lns_sec));
+            double phase = fmod(prog_frac * 3.0, 1.0);
+            double temp = max(0.05, 1.2 * (1.0 - phase));
+            int dE = new_dag_len - cur_dag_len;
+            if (dE <= 0 || (new_dag_len <= best_dag_len + 2 &&
+                            ((double)(rng() % 10000) / 10000.0) < exp(-(double)dE / temp))) {
+                cur_dag = move(td);
+                cur_ord = move(out_ord);
+                cur_dag.analyse();
+                rebuild_clusters();
+                stall++;
+            } else {
+                stall++;
+            }
+            if (stall >= 12) {
+                cur_dag = best_dag;
+                cur_ord = best_ord;
+                cur_dag.analyse();
+                rebuild_clusters();
+                stall = 0;
+            }
+        }
+    }
+    return res;
+}
+
+static int run_macro_mode(const vector<PuzzleIn> &puzzles, const Params &P) {
+    auto in_progs = load_progs_file(P.macro_path);
+    vector<string> out_lines(puzzles.size());
+    vector<string> pool_lines(puzzles.size());
+    atomic<int> nextp{0};
+    mutex mu;
+    long long tot_old = 0, tot_new = 0, tot_dw = 0, tot_cw = 0, tot_sp = 0, tot_it = 0, tot_arch = 0;
+    double t0 = now_sec();
+
+    auto worker = [&]() {
+        while (true) {
+            int k = nextp++;
+            if (k >= (int)puzzles.size()) break;
+            const auto &pz = puzzles[k];
+            auto it = in_progs.find(pz.id);
+            if (it == in_progs.end()) continue;
+            int olen = (int)it->second.size();
+            mt19937_64 rng((u64)P.seed * 1000003ULL + hash<string>()(pz.id));
+
+            MacroResult mr;
+            double tp0 = now_sec();
+            if (olen >= P.min_len && olen <= P.max_len) {
+                mr = macro_optimize(pz.L, pz.s, pz.t, it->second, P, rng);
+            } else {
+                mr.prog = it->second;
+                mr.archive.push_back(it->second);
+            }
+            string why = verify_prog(pz.L, pz.s, pz.t, mr.prog);
+            if (!why.empty()) {
+                mr.prog = it->second;
+            }
+            out_lines[k] = pz.id + " " + to_string(mr.prog.size()) + " " + to_json(mr.prog);
+            if (!P.macro_pool_path.empty()) {
+                vector<string> vlines;
+                for (const auto &ap : mr.archive) {
+                    if (verify_prog(pz.L, pz.s, pz.t, ap).empty())
+                        vlines.push_back(to_string(ap.size()) + " " + to_json(ap) + "\n");
+                }
+                string pl = "PUZ " + pz.id + " " + to_string(mr.prog.size()) + " " + to_string(vlines.size()) + "\n";
+                for (const auto &vl : vlines) pl += vl;
+                pool_lines[k] = move(pl);
+            }
+            double dt = now_sec() - tp0;
+
+            lock_guard<mutex> g(mu);
+            tot_old += olen;
+            tot_new += (long long)mr.prog.size();
+            tot_dw += mr.dag_wins;
+            tot_cw += mr.cmp_wins;
+            tot_sp += mr.spill_drops;
+            tot_it += mr.iters;
+            tot_arch += (long long)mr.archive.size();
+            if (mr.cmp_wins > 0 || mr.dag_wins > 0 || P.verbose || puzzles.size() <= 20 || (k + 1) % 20 == 0) {
+                fprintf(stderr, "%s: %d -> %zu (it=%d dw=%d cw=%d sp=%d bdel=%+d arch=%zu %.1fs)\n",
+                        pz.id.c_str(), olen, mr.prog.size(), mr.iters, mr.dag_wins,
+                        mr.cmp_wins, mr.spill_drops, mr.best_delta, mr.archive.size(), dt);
+            }
+        }
+    };
+
+    vector<thread> th;
+    int nt = max(1, min(P.threads, (int)puzzles.size()));
+    for (int i = 0; i < nt; i++) th.emplace_back(worker);
+    for (auto &t : th) t.join();
+
+    if (!P.out_path.empty()) {
+        FILE *fo = fopen(P.out_path.c_str(), "w");
+        if (!fo) return 1;
+        for (const auto &s : out_lines) if (!s.empty()) fprintf(fo, "%s\n", s.c_str());
+        fclose(fo);
+    } else {
+        for (const auto &s : out_lines) if (!s.empty()) printf("%s\n", s.c_str());
+    }
+    if (!P.macro_pool_path.empty()) {
+        FILE *fp = fopen(P.macro_pool_path.c_str(), "w");
+        if (fp) {
+            for (const auto &s : pool_lines) if (!s.empty()) fputs(s.c_str(), fp);
+            fclose(fp);
+        }
+    }
+    fprintf(stderr, "MACRO TOTAL: old=%lld new=%lld (%+lld) iters=%lld dw=%lld cw=%lld spills=%lld arch=%lld time=%.1fs\n",
+            tot_old, tot_new, tot_new - tot_old, tot_it, tot_dw, tot_cw, tot_sp, tot_arch, now_sec() - t0);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     Params P;
     string inpath;
@@ -5120,6 +5834,10 @@ int main(int argc, char **argv) {
         else if (a == "-lalt") P.la_alts = stoi(nx());
         else if (a == "-lns") P.lns_path = nx();
         else if (a == "-sa") P.sa_path = nx();
+        else if (a == "-macro") P.macro_path = nx();
+        else if (a == "-macro_pool") P.macro_pool_path = nx();
+        else if (a == "-min_len") P.min_len = stoi(nx());
+        else if (a == "-max_len") P.max_len = stoi(nx());
         else if (a == "-o") P.out_path = nx();
         else if (a == "-pool") P.pool_path = nx();
         else if (a == "-dag") P.dag_path = nx();
@@ -5139,7 +5857,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: elf2 PUZZLES.txt [-construct 1] [-multi N] [-lns PROGS.txt] [-sa PROGS.txt] [-pool OUT] [-dag DAG] [-sched-test PROGS] [-lsec S] ...\n");
         return 1;
     }
-    if (P.lns_sec < 0) P.lns_sec = ((!P.lns_path.empty() || !P.sa_path.empty()) && !P.construct) ? 30.0 : 0.0;
+    if (P.lns_sec < 0) P.lns_sec = ((!P.lns_path.empty() || !P.sa_path.empty() || !P.macro_path.empty()) && !P.construct) ? 15.0 : 0.0;
 
     vector<PuzzleIn> puzzles;
     {
@@ -5162,6 +5880,7 @@ int main(int argc, char **argv) {
     if (!P.sched_test_path.empty()) return run_sched_test(puzzles, P);
     if (!P.pool_path.empty()) return run_export_pool(puzzles, P);
     if (!P.dag_path.empty()) return run_dag_mode(puzzles, P);
+    if (!P.macro_path.empty()) return run_macro_mode(puzzles, P);
 
     unordered_map<string, vector<Instr>> lns_in;
     if (!P.sa_path.empty()) lns_in = load_progs_file(P.sa_path);
