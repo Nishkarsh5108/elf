@@ -88,3 +88,12 @@ top-10 ~130.5k. Many people grind LNS on the same public programs for ~10s of in
   using cheap differences derived from the start values) and second-level multipliers.
 * LNS that removes k<=4 targets and re-plans them with our planner finds nothing on public programs
   (locally tight). Public LNS tools are saturated on the public frontier (goodpjw2008's history).
+
+## Structured puzzles look near-optimal in public (2026-11-21, E030-E032)
+On scored_0127 the public program's first 25 instructions reproduce what looks like the generator's own
+chain (17=7+10, 289=17^2, 271=289-18, 260=271-11, 586=260+326, 521=586-65, 847=326+521, 13552=16*847,
+13541=13552-11, ...); those intermediates then reappear inside targets as multipliers/offsets
+(t = m*(b_i*b_j) + d with m in {65, 260, 521, 1043, 16672, ...}). Later targets cost 2.3 instructions on
+average. CP-SAT over a pool of 47k structure-derived recipes (hinted with public) cannot shorten it.
+Working hypothesis: on structured puzzles public is close to the hidden program; the leaderboard gap
+(leader 4% ahead) is more likely on independent (random-target) puzzles.

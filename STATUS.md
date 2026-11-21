@@ -3,7 +3,7 @@
 _Last updated: 2026-11-21_
 
 ## Current best
-* **LB 133,860** (= local score; there is no public/private split). File: `out/public_merge.csv` (not in
+* **LB 133,785** (= local score; there is no public/private split). File: `out/public_merge.csv` (not in
   git; regenerate as below). It is a verified per-puzzle merge of public program datasets; none of our
   own programs beat it yet.
 * LB context (2026-11-21): leader 128,330 (ryan), 2nd 128,830, top-10 ~130.4k, best public ~133.86k.
@@ -61,11 +61,13 @@ table for us (safety rule on executing downloaded code); public *programs* are f
 
 ## Next steps (in order)
 0. Refresh the public merge daily (`scripts/fetch_public.sh` + `src/merge.py`); so far the only source
-   of LB gains (133,928 -> 133,860).
-1. Structured puzzles (742, ~87k instructions): plan *cluster chains* (order targets so that each next
-   target is 1-2 ops from the previous using cheap differences built from start values) and discover
-   second-level hidden multipliers (targets ~ m * base-product +- small). This is where public beats us
-   most (e.g. scored_0127: 96 vs our 116 with bases).
-2. Independent puzzles (242, ~47k): our later targets cost ~7.3 vs public ~6.6 instructions; better
-   sharing via deeper lookahead / beam with a better remaining-cost estimate.
+   of LB gains (133,928 -> 133,860 -> 133,785). Include notebook outputs (`kaggle kernels output`) of the
+   newest public notebooks; they are often ahead of the datasets.
+1. Build a strong LNS operator of our own that introduces *new* helper values for groups of 2-4 targets
+   (public "quartet"/helper moves are what took planner output ~6% lower; ours gains ~0.1%). Only with
+   such an operator can our diverse constructions compete per puzzle.
+2. Independent puzzles (242, ~47k): most likely where the leader's 4% comes from (structured puzzles look
+   close to the generator program in public, E030-E032). Our later targets cost ~7.3 vs public ~6.6.
 3. Once the engine produces wins, run it at scale with `kaggle/push_shards.py` and merge.
+Deprioritised after testing: cluster-chain / structure-pool planning on structured puzzles (E030-E032),
+random-basis register files (E034), exact single-target re-synthesis (E033).
