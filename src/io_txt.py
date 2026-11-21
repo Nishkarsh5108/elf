@@ -1,7 +1,7 @@
-"""Convert puzzles to the engine's text format and engine output back to a verified submission."""
+"""Convert puzzles to the engine's text format and engine output / submissions back and forth."""
 import sys, os, json
 sys.path.insert(0, os.path.dirname(__file__))
-from santa import load_puzzles, verify, InvalidProgram, write_submission
+from santa import load_puzzles, load_submission, verify, InvalidProgram, write_submission
 
 
 def write_puzzles_txt(path, puzzles):
@@ -35,3 +35,16 @@ if __name__ == '__main__':
             else: ids = set(flt.split(',')); P = [p for p in P if p.id in ids]
         write_puzzles_txt(sys.argv[2], P)
         print(len(P), 'puzzles')
+    elif cmd == 'sub2txt':  # io_txt.py sub2txt OUT.txt SUB.csv [IDS_COMMA]
+        out_path, sub_path = sys.argv[2], sys.argv[3]
+        sub = load_submission(sub_path)
+        if len(sys.argv) > 4:
+            ids = [x for x in sys.argv[4].split(',') if x]
+        else:
+            ids = sorted(sub.keys())
+        with open(out_path, 'w', encoding='utf-8') as f:
+            for pid in ids:
+                if pid in sub:
+                    js = json.dumps(sub[pid], separators=(',', ':'))
+                    f.write(f"{pid} {len(sub[pid])} {js}\n")
+        print(len(ids), 'programs written to', out_path)

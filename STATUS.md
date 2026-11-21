@@ -3,10 +3,8 @@
 _Last updated: 2026-11-21_
 
 ## Current best
-* **LB 133,785** (= local score; there is no public/private split). File: `out/public_merge.csv` (not in
-  git; regenerate as below). It is a verified per-puzzle merge of public program datasets; none of our
-  own programs beat it yet.
-* LB context (2026-11-21): leader 128,330 (ryan), 2nd 128,830, top-10 ~130.4k, best public ~133.86k.
+* **Verified local best 133,772** (`out/public_merge.csv`, refreshed via E038 from 13 datasets + 7 notebook outputs; **LB 133,785** from E036 — saving daily submissions for solver wins below 133,772).
+* LB context (2026-11-21): leader 128,330 (ryan), 2nd 128,766, 3rd 128,830, top-10 ~130.4k, best public 133,772.
 
 ## Reproduce
 ```bash
@@ -35,6 +33,7 @@ of both our submissions exactly.
   * register allocator: rematerialisation-aware Belady, tries 4 schedule/seed modes, `-reorder N`
     hill-climbs target order to remove spills; reproduces every public program's length exactly;
   * modes: `-lns progs.txt -lsec S -lk K` (window LNS), `-dag file` (compile a DAG).
+* `cpp/elf2.cpp` next-gen engine (in development, E039–E040 baseline on 12-puzzle `bench12`): 5-engine `DeepSearch` (exact `<=4` MITM, `S01×S012`/`S2×S2` product-diff, 64-bit `T±C` factoring + 3-factor + S3-cofactor, target-diff/div wrappers, product-residual beam), peak-liveness scheduler + Belady fallback, `-construct`, `-lns`.
 * `cpp/bases.cpp` hidden-base discovery (pairwise gcd of offset targets + binomial significance test).
 * `cpp/mitm_probe.cpp` exact depth<=7 reachability probe; `eda/` analyses; `scripts/` helpers.
 * `kaggle/push_shards.py` + `kaggle/run_kernel.py`: private dataset + private CPU kernels, one shard each

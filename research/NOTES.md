@@ -97,3 +97,27 @@ chain (17=7+10, 289=17^2, 271=289-18, 260=271-11, 586=260+326, 521=586-65, 847=3
 average. CP-SAT over a pool of 47k structure-derived recipes (hinted with public) cannot shorten it.
 Working hypothesis: on structured puzzles public is close to the hidden program; the leaderboard gap
 (leader 4% ahead) is more likely on independent (random-target) puzzles.
+
+## Deep EDA & Forum Synthesis (2026-11-21)
+* **`konbu17` (142,940) vs `public_merge` (133,785) by predicted family** (using Atlas predictions):
+  * `independent` (249): 47,974 -> 47,273 (-701, -1.46%); helper Jaccard overlap 0.712 (208/249 > 0.5); 171/249 barely improved (`pub >= konbu17 - 3`, 32,157 instr).
+  * `mixed` (204): 33,858 -> 32,405 (-1,453, -4.29%); helper Jaccard 0.494; 91/204 barely improved (13,723 instr).
+  * `shared` (295): 37,516 -> 32,003 (-5,513, -14.70%); helper Jaccard 0.250; 66/295 barely improved (6,216 instr).
+  * `multiplicative` (235): 23,513 -> 22,025 (-1,488, -6.33%); helper Jaccard 0.266; 49/235 barely improved (3,740 instr).
+  * `tiny` (17): 79 -> 79 (0.00%).
+* **Why `mixed` is half-hard**: On `practice_puzzles.csv` (`hard` tier), `mixed` puzzles have median 48% of their targets in `[L/10, L]` (uniform random range), vs 4% in `shared` and 4% in `multiplicative`. Thus `mixed` puzzles are roughly half structured + half independent random targets.
+* **Independent scale wall**: Across bit widths (`<=35b`: 4.22/t, `36-44b`: 5.74/t, `45-53b`: 7.19/t, `54-61b`: 8.61/t), public holds roughly constant ~6.8-7.0 bits/op. Register snapshots in `scored_0001` (`Lbits=50.4`) concentrate 30/48 registers in `[0.4L, 0.55L]` (20-26b mid-scale factors), while `scored_0002` (`Lbits=59.8`) has 24/48 registers `<0.25L` and 14/48 `>0.8L` (completed targets) late in the run. Peak live registers hit `>=45` in 201/249 `independent` and 140/204 `mixed` public programs (avg `max_live` 44.0 and 42.2).
+* **Why existing search engines miss random-target improvements**:
+  1. `cpp/elf.cpp` uses `q*a ± r` with `r = T % a < a` (`a` in `S0∪S1`), missing `T = A*B ± C` when `C > A`, `A,B ∈ S2`, `T ± C` exact 64-bit factorizations (`A*B` where `A ∈ S3` or 3-factor products), and `k*T = A*B ± C`; it also mixes large completed targets and 28 mostly unused palette constants into `S1`/`S2` leaves.
+  2. Public LNS (`elfopt`, `quartet`) only searches exact depth `<=4` + a shallow depth-5 window, too shallow to resynthesize 6-8 op independent targets or synthesize new shared helpers for 2-4 random targets.
+* **Forum insights (2026-11-21)**:
+  * `hengck23` (thread 760095): 66% of 158k->146k gains from deeper per-target steps on fixed helpers, 15% from tearing out target groups + building a new common helper, 12% from cheaper helper synthesis; Georgy Mamarin noted unconstrained (>48 reg) plans are ~9% shorter.
+  * `hh hhhokk` (760326): `D_48` (deciding `<= k` instructions with 48 registers) is NP-complete via grid Hamilton path.
+  * `Georgy Mamarin` (760300, 760285): Hcub cumulative-benefit intermediate selection, Aksoy DFS pruning, STOKE MCMC uphill moves, Hutton Countdown symmetry pruning; `independent` = `max(start) >= 100`.
+  * `Santiago Zazo` (760674): register liveness visualization, backward DCE, unlabeled smoothness + excess hit-rate detector.
+  * `Farrukh Hussain` (760688): public frontier (~134.6k) relies on Rust polish, joint recipes, MITM, and `<=6`-step chain cutting; first target averages ~17.75 instr.
+* **Deep DAG & Search Diagnostics on `133,772` & `elf2` (E038–E040)**:
+  * Across all 1,000 `public_merge` programs (`133,772` instr): **private target cones = 55,359 (41.4%)**, `sh2` (shared by 2 targets) = 17,305 (12.9%), `sh3+` (shared backbone `>= 3` targets) = **61,108 (45.7%)**. Only 1,503 / 26,898 targets have `priv >= 6` (546 with `priv >= 7`, 95 with `priv >= 8`). Thus small `k <= 4` LNS only touches local cones while global `sh3+` backbone selection requires large-window moves (`k >= 5`) or global CP-SAT recombination.
+  * On `PUB`'s hard 50–60b targets (`priv = 6..8` in `scored_0001`, `0002`, `0808`), **pairwise large-value sums/diffs `U1 ± U2`** and **full-pool `A*B`** slash the residual by 8–19 bits (e.g., `60b -> 41–47b`, `49b -> 34b`). Exiling `> L^0.78` nodes and large targets from `PoolDict` leaves blocked these recipes in `E039`/`E040`.
+  * `PUB` interleaves target cones to stay at `peak = 48` (e.g., `scored_0002` spends 118/245 steps at peak `>= 46`), causing greedy `schedule_min_live` to fail `0/32` on all 6 hard 50–60b `PUB` DAGs and triggering `rejp = 115` in `E040`; SA / topological insertion from `pref_ord` is needed for zero-spill scheduling.
+  * In `E039` (`-construct`), blind constant lookahead fallback on 50–60b targets and `build_binary` fallback on 2-start 60b puzzles (`scored_0808` `t0 = 84`) crippled constructive synthesis.
