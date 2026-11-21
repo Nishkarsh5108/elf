@@ -53,6 +53,8 @@ struct Params {
     int lns_kmax = 4;        // LNS: max targets removed per move
     int mitm = 0;            // root meet-in-the-middle with the S3 bloom
     int rootfull = 0;        // root: use every dictionary value as a factor
+    long long dict_cap = 0;  // cap on dictionary entries (0 = none)
+    int beam = 1;            // program-level beam width (>1 enables beam search; uses -la as expansions per state)
     int seed = 1;
     double noise = 0.0;      // random tie-break noise added to target costs
     int threads = 8;
@@ -138,6 +140,7 @@ struct Dict {
     vector<int> low, leaves_all, s1_all;               // ids of leaves and level-1 entries
     vector<int> xs_ins;                                // incremental extras in insertion order
     bool incremental = false;
+    size_t cap_entries = 0;  // optional dictionary size cap (0 = none)
     struct Mark { size_t e, used, low, leaves, s1, xs, saved; };
     vector<pair<int, Expr>> saved;   // entries promoted to leaves by add_leaves (restored on rollback)
     Mark mark() const { return {e.size(), index.used.size(), low.size(), leaves_all.size(), s1_all.size(), xs_ins.size(), saved.size()}; }
@@ -189,7 +192,7 @@ struct Dict {
     Bloom bloom;  // values of tree cost 3 (S2 op S0, S1 op S1)
     Dict() { index.init(20); }
     inline void add(u64 v, int a, int b, char op, int cost) {
-        if (v == 0 || v > L || cost > MAXC) return;
+        if (v == 0 || v > L || cost > MAXC || (cap_entries && e.size() >= cap_entries)) return;
         int id = index.find_or_insert(v, (int)e.size());
         if (id == -1) { e.push_back({v, a, b, op, (uint8_t)cost}); if (incremental) touched.push_back((int)e.size() - 1); }
         else if (id >= 0 && cost < e[id].cost && e[id].a >= 0) {
@@ -642,7 +645,91 @@ struct Planner {
             remaining.swap(rem2);
         }
     }
+    // candidate derivations (with alternatives) for every remaining target from the current state
+    vector<Cand> candidates(Dict &d, const vector<u64> &remaining) {
+        { auto lv_ = leaves(); d.build(lv_, leaf_costs, L); }
+        Search s(d, P); s.slack = P.la_slack;
+        vector<Cand> cands;
+        for (u64 t : remaining) {
+            s.run(t);
+            if (s.end < 0) continue;
+            vector<Sol> so = s.sols;
+            sort(so.begin(), so.end(), [](const Sol &a, const Sol &b) { return a.cost < b.cost; });
+            int kept = 0; set<vector<u64>> seen;
+            for (auto &sol : so) {
+                if (kept >= P.la_alts) break;
+                size_t n0 = order.size();
+                try { build_sol(d, s, sol, t); } catch (exception &) { rollback(n0); continue; }
+                Cand c{t, {}};
+                for (size_t k = n0; k < order.size(); k++) c.nodes.push_back(defs[order[k]]);
+                rollback(n0);
+                vector<u64> key; for (auto &n : c.nodes) key.push_back(n.v);
+                if (!seen.insert(key).second) continue;
+                cands.push_back(move(c)); kept++;
+            }
+        }
+        stable_sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) { return a.nodes.size() < b.nodes.size(); });
+        return cands;
+    }
+    void refresh_done() { done.clear(); for (u64 t : targets) if (have.count(t)) done.insert(t); }
+    vector<u64> still_needed() { vector<u64> r; for (u64 t : targets) if (!have.count(t)) r.push_back(t); return r; }
+    // program-level beam search over planner states
+    void solve_beam(Dict &d) {
+        setup();
+        size_t base = order.size();
+        set<u64> base_have = have; map<u64, Node> base_defs = defs;
+        struct BE { vector<Node> nodes; double score; bool fin; };
+        vector<BE> beam{{{}, 0.0, false}};
+        auto restore = [&](const vector<Node> &nodes) {
+            rollback(base); apply(nodes); refresh_done();
+        };
+        int guard = 0;
+        while (guard++ < 200) {
+            vector<BE> kids; bool any = false;
+            for (auto &be : beam) {
+                if (be.fin) { kids.push_back(be); continue; }
+                restore(be.nodes);
+                vector<u64> rem = still_needed();
+                if (rem.empty()) { kids.push_back({be.nodes, (double)be.nodes.size(), true}); continue; }
+                any = true;
+                auto cands = candidates(d, rem);
+                if (cands.empty()) {  // fallback: binary build of one target
+                    size_t n0 = order.size(); binary(rem[0]);
+                    vector<Node> nn = be.nodes; for (size_t k = n0; k < order.size(); k++) nn.push_back(defs[order[k]]);
+                    kids.push_back({nn, (double)nn.size(), false});
+                    continue;
+                }
+                int M = min<int>(P.lookahead, cands.size());
+                for (int k = 0; k < M; k++) {
+                    set<u64> made; for (auto &n : cands[k].nodes) made.insert(n.v);
+                    vector<u64> rest; for (u64 x : rem) if (!made.count(x)) rest.push_back(x);
+                    double h = rest.empty() ? 0 : remaining_cost_inc(d, cands[k].nodes, rest, P.la_width);
+                    vector<Node> nn = be.nodes; nn.insert(nn.end(), cands[k].nodes.begin(), cands[k].nodes.end());
+                    kids.push_back({nn, nn.size() + P.la_weight * h, rest.empty()});
+                }
+            }
+            sort(kids.begin(), kids.end(), [](const BE &a, const BE &b) { return a.score < b.score; });
+            vector<BE> nb; set<vector<u64>> seen;
+            for (auto &k : kids) {
+                vector<u64> key; for (auto &n : k.nodes) key.push_back(n.v);
+                sort(key.begin(), key.end());
+                if (!seen.insert(key).second) continue;
+                nb.push_back(k);
+                if ((int)nb.size() >= P.beam) break;
+            }
+            beam.swap(nb);
+            if (!any) break;
+            if (P.verbose > 1) fprintf(stderr, "  beam step: best score %.1f size %zu fin=%d\n", beam[0].score, beam[0].nodes.size(), (int)beam[0].fin);
+        }
+        // best finished state
+        int bi = -1;
+        for (int i = 0; i < (int)beam.size(); i++) if (beam[i].fin && (bi < 0 || beam[i].nodes.size() < beam[bi].nodes.size())) bi = i;
+        if (bi < 0) bi = 0;
+        restore(beam[bi].nodes);
+        for (u64 t : still_needed()) binary(t);
+    }
     void solve(Dict &d) {
+        if (P.beam > 1) { solve_beam(d); return; }
         if (P.lookahead > 0) { solve_lookahead(d); return; }
         setup();
         vector<u64> remaining;
@@ -990,6 +1077,8 @@ int main(int argc, char **argv) {
         else if (a == "-lk") P.lns_kmax = stoi(nx());
         else if (a == "-mitm") P.mitm = stoi(nx());
         else if (a == "-rf") P.rootfull = stoi(nx());
+        else if (a == "-B") P.beam = stoi(nx());
+        else if (a == "-cap") P.dict_cap = stoll(nx());
         else inpath = a;
     }
     map<string, vector<Instr>> lnsin;
@@ -1012,7 +1101,7 @@ int main(int argc, char **argv) {
     atomic<int> nextp{0}; mutex mu; long total = 0;
     auto t0 = chrono::steady_clock::now();
     auto worker = [&]() {
-        Dict d; d.bloom.init(P.bloom_lg);
+        Dict d; d.bloom.init(P.bloom_lg); d.cap_entries = P.dict_cap;
         while (true) {
             int k = nextp++;
             if (k >= (int)puzzles.size()) break;
