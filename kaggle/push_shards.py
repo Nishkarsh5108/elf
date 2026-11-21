@@ -53,15 +53,15 @@ def launch(name, n, args, puzzles='p_all.txt', only=None):
         print(r.stdout[-400:], r.stderr[-400:])
 
 
-def status(name, n):
-    for k in range(n):
+def status(name, n, only=None):
+    for k in (only if only is not None else range(n)):
         r = sh([K, 'kernels', 'status', f'{USER}/elf-{name}-{k}'])
         print(k, (r.stdout + r.stderr).strip()[-200:])
 
 
-def fetch(name, n, out):
+def fetch(name, n, out, only=None):
     os.makedirs(out, exist_ok=True)
-    for k in range(n):
+    for k in (only if only is not None else range(n)):
         d = os.path.join(out, f'{name}-{k}')
         os.makedirs(d, exist_ok=True)
         r = sh([K, 'kernels', 'output', f'{USER}/elf-{name}-{k}', '-p', d])
@@ -74,5 +74,5 @@ if __name__ == '__main__':
     elif c == 'launch':
         only = [int(x) for x in sys.argv[6].split(',')] if len(sys.argv) > 6 else None
         launch(sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else 'p_all.txt', only)
-    elif c == 'status': status(sys.argv[2], int(sys.argv[3]))
-    elif c == 'fetch': fetch(sys.argv[2], int(sys.argv[3]), sys.argv[4])
+    elif c == 'status': status(sys.argv[2], int(sys.argv[3]), [int(x) for x in sys.argv[4].split(',')] if len(sys.argv) > 4 else None)
+    elif c == 'fetch': fetch(sys.argv[2], int(sys.argv[3]), sys.argv[4], [int(x) for x in sys.argv[5].split(',')] if len(sys.argv) > 5 else None)

@@ -935,19 +935,45 @@ static vector<Instr> compile_mode(const vector<u64> &starts, const vector<u64> &
 }
 
 static string verify_prog(u64 L, const vector<u64> &starts, const vector<u64> &targets, const vector<Instr> &prog);
+static int g_reorder_tries = 0;
 // try several schedules / seed policies, return the shortest program that verifies
 static vector<Instr> compile(const vector<u64> &starts, const vector<u64> &targets, const map<u64, Node> &defs,
                              const vector<u64> &order, int *plan_size = nullptr, u64 L = 0) {
     vector<Instr> best; bool have = false;
+    int psz = 0;
     for (int mode = 0; mode < 4; mode++) {
         bool po = mode & 1, se = mode & 2;
         try {
-            auto p = compile_mode(starts, targets, defs, order, plan_size, po, se);
+            auto p = compile_mode(starts, targets, defs, order, &psz, po, se);
             if (L && !verify_prog(L, starts, targets, p).empty()) continue;
             if (!have || p.size() < best.size()) { best = p; have = true; }
         } catch (exception &) {}
     }
     if (!have) throw runtime_error("compile failed");
+    if (plan_size) *plan_size = psz;
+    // spill overhead left: hill-climb over the order in which target cones are emitted
+    if (g_reorder_tries > 0 && (int)best.size() > psz) {
+        set<u64> tset(targets.begin(), targets.end()), sset(starts.begin(), starts.end());
+        vector<u64> tord;
+        for (u64 v : order) if (tset.count(v) && !sset.count(v)) tord.push_back(v);
+        mt19937_64 rng(tord.size() * 7919 + best.size());
+        size_t cur = best.size();
+        for (int it = 0; it < g_reorder_tries && (int)cur > psz && tord.size() > 2; it++) {
+            auto cand = tord;
+            size_t i = rng() % cand.size(), j = rng() % cand.size();
+            u64 x = cand[i]; cand.erase(cand.begin() + i); cand.insert(cand.begin() + min(j, cand.size()), x);
+            for (bool se : {true, false}) {
+                try {
+                    auto p = compile_mode(starts, targets, defs, cand, nullptr, false, se);
+                    if (p.size() > cur) continue;
+                    if (L && !verify_prog(L, starts, targets, p).empty()) continue;
+                    tord = cand; cur = p.size();
+                    if (p.size() < best.size()) best = p;
+                    break;
+                } catch (exception &) {}
+            }
+        }
+    }
     return best;
 }
 
@@ -1079,6 +1105,7 @@ int main(int argc, char **argv) {
         else if (a == "-rf") P.rootfull = stoi(nx());
         else if (a == "-B") P.beam = stoi(nx());
         else if (a == "-cap") P.dict_cap = stoll(nx());
+        else if (a == "-reorder") g_reorder_tries = stoi(nx());
         else inpath = a;
     }
     map<string, vector<Instr>> lnsin;
