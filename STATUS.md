@@ -35,7 +35,8 @@ of both our submissions exactly.
     hill-climbs target order to remove spills; reproduces every public program's length exactly;
   * modes: `-lns progs.txt -lsec S -lk K` (window LNS), `-dag file` (compile a DAG).
 * `cpp/elf2.cpp` next-gen engine (E039–E052): 5-engine `DeepSearch` (exact `<=4` MITM, `S01×S012`/`S2×S2`/`P1±P1`/`T±C` product-diff, 64-bit `T±C` factoring + 3-factor + S3-cofactor, target-diff/div wrappers, product-residual beam), minimal-perturbation peak-liveness scheduler (`eval_order`, bottleneck `fix_pressure_sa`, Kahn's + Belady fallback), hidden-base discovery + hub injection + live-pressure lookahead in `-construct` (with `-multi N`), E-graph + voted-hub `-pool` exporter, `-dag` compiler, `-lns`, Soft-Peak Herfindahl DAG-SA (`-sa`), and CF/GCD Macro-SA near-best archive harvester (`-macro`).
-* `cpp/elf3.cpp` zero-spill exact DAG knockout engine (E051): bitset closure, active witness tracking, `repair_ban` bridge repair, multi-donor crossover, and neutral walk.
+* `cpp/elf3.cpp` zero-spill exact DAG knockout engine (`v2`, E051/E053b): bitset closure, active witness tracking, `1/2-bridge {h1, h2}` `repair_ban`, 64-bit Pollard-Rho factoring + `try_cone_rebuild` (`1..4`-step rebuild), `+1` uphill backbone kicks, `24`-DAG archive crossover, and neutral walk.
+* `src/recombine.py` OR-Tools CP-SAT free-order DAG recipe recombinator (supports `--donors` multi-donor `PUZ` archives).
 * `cpp/s2_mitm.cpp` sharded 64-segment L3-friendly full-DAG `S2` + 6-shape MITM probe (E050).
 * `src/export_donors.py` multi-donor verified recipe/DAG exporter (`PUZ pid blen nd` format) from `out/` + `ext/` CSVs.
 * `cpp/bases.cpp` hidden-base discovery (pairwise gcd of offset targets + binomial significance test).

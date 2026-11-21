@@ -227,10 +227,32 @@ def load_extra_recipes(path):
     return out
 
 
+def load_donor_progs(paths):
+    import json
+    by_pid = {}
+    for path in paths:
+        if not path:
+            continue
+        with open(path) as f:
+            lines = iter(f)
+            for line in lines:
+                s = line.strip()
+                if not s or not s.startswith('PUZ '):
+                    continue
+                _, pid, _, nd = s.split()
+                lst = by_pid.setdefault(pid, [])
+                for _ in range(int(nd)):
+                    dl = next(lines).strip()
+                    _, prog_s = dl.split(None, 1)
+                    lst.append([tuple(op) for op in json.loads(prog_s)])
+    return by_pid
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('out'); ap.add_argument('ids')
-    ap.add_argument('--sources', nargs='+', required=True)
+    ap.add_argument('--sources', nargs='*', default=[])
+    ap.add_argument('--donors', nargs='*', default=[])
     ap.add_argument('--extra-recipes', default='')
     ap.add_argument('--pool', type=int, default=0); ap.add_argument('--time', type=float, default=20)
     ap.add_argument('--threads', type=int, default=8)
@@ -239,9 +261,13 @@ def main():
     P = load_puzzles()
     if a.ids == 'all': ids = [p.id for p in P]
     elif a.ids.startswith('every'): ids = [p.id for p in P][::int(a.ids[5:])]
-    else: ids = a.ids.split(',')
+    elif a.ids.startswith('@'):
+        want = [x.strip() for x in open(a.ids[1:]).read().replace('\n', ',').split(',') if x.strip()]
+        ids = want
+    else: ids = [x for x in a.ids.split(',') if x]
     Pd = {p.id: p for p in P}
     srcs = [load_progs(f) for f in a.sources]
+    donors = load_donor_progs(a.donors)
     extra = load_extra_recipes(a.extra_recipes) if a.extra_recipes else {}
 
     def run_one(pid):
@@ -252,6 +278,10 @@ def main():
                 recs |= recipes_of(p, S[pid])
                 if best is None or len(S[pid]) < best:
                     best = len(S[pid]); hint = recipe_seq(p, S[pid])
+        for prog in donors.get(pid, ()):
+            recs |= recipes_of(p, prog)
+            if best is None or len(prog) < best:
+                best = len(prog); hint = recipe_seq(p, prog)
         if pid in extra:
             recs |= extra[pid]
         if a.pool:

@@ -47,6 +47,132 @@ static inline u64 mix64(u64 x) {
     return x;
 }
 
+// ---------------------------------------------------------------- 64-bit Factoring (Miller-Rabin + Brent Pollard-Rho)
+static inline u64 mulmod64(u64 a, u64 b, u64 m) {
+    return (u64)(((u128)a * b) % m);
+}
+
+static u64 powmod64(u64 a, u64 e, u64 m) {
+    u64 r = 1 % m;
+    a %= m;
+    while (e) {
+        if (e & 1) r = mulmod64(r, a, m);
+        a = mulmod64(a, a, m);
+        e >>= 1;
+    }
+    return r;
+}
+
+static bool is_prime64(u64 n) {
+    if (n < 2) return false;
+    static constexpr u64 sprimes[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
+    for (u64 p : sprimes) {
+        if (n == p) return true;
+        if (n % p == 0) return false;
+    }
+    u64 d = n - 1;
+    int s = 0;
+    while ((d & 1) == 0) { d >>= 1; s++; }
+    static constexpr u64 bases[] = {2ULL, 325ULL, 9375ULL, 28178ULL, 450775ULL, 9780504ULL, 1795265022ULL};
+    for (u64 a : bases) {
+        if (a % n == 0) continue;
+        u64 x = powmod64(a, d, n);
+        if (x == 1 || x == n - 1) continue;
+        bool comp = true;
+        for (int r = 1; r < s; r++) {
+            x = mulmod64(x, x, n);
+            if (x == n - 1) { comp = false; break; }
+        }
+        if (comp) return false;
+    }
+    return true;
+}
+
+static u64 pollard_rho(u64 n, u64 seed) {
+    if ((n & 1ULL) == 0) return 2;
+    for (u64 att = 0; att < 12; att++) {
+        u64 y = (mix64(seed + att * 0x9e3779b97f4a7c15ULL) % (n - 2)) + 2;
+        u64 c = (mix64(seed * 31ULL + att + 7ULL) % (n - 1)) + 1;
+        u64 q = 1, g = 1, r = 1, x = 0, ys = 0;
+        constexpr u64 m = 128;
+        int steps = 0;
+        while (g == 1 && steps < 4096) {
+            x = y;
+            for (u64 i = 0; i < r; i++) y = (mulmod64(y, y, n) + c) % n;
+            u64 k = 0;
+            while (k < r && g == 1 && steps < 4096) {
+                ys = y;
+                u64 lim = min(m, r - k);
+                for (u64 i = 0; i < lim; i++) {
+                    y = (mulmod64(y, y, n) + c) % n;
+                    u64 diff = x > y ? x - y : y - x;
+                    q = mulmod64(q, diff, n);
+                }
+                g = std::gcd(q, n);
+                k += m;
+                steps++;
+            }
+            r <<= 1;
+        }
+        if (g == n) {
+            do {
+                ys = (mulmod64(ys, ys, n) + c) % n;
+                u64 diff = x > ys ? x - ys : ys - x;
+                g = std::gcd(diff, n);
+                steps++;
+            } while (g == 1 && steps < 4200);
+        }
+        if (g > 1 && g < n) return g;
+    }
+    return n;
+}
+
+static void factor64_rec(u64 n, vector<u64> &pf, int depth = 0) {
+    if (n <= 1) return;
+    if (is_prime64(n)) { pf.push_back(n); return; }
+    if (depth >= 48) { pf.push_back(n); return; }
+    u64 d = pollard_rho(n, n ^ ((u64)depth * 0x517cc1b727220a95ULL + 13ULL));
+    if (d == 1 || d == n) { pf.push_back(n); return; }
+    factor64_rec(d, pf, depth + 1);
+    factor64_rec(n / d, pf, depth + 1);
+}
+
+static vector<pair<u64, u64>> get_divisor_pairs(u64 n, size_t max_pairs = 256) {
+    vector<pair<u64, u64>> out;
+    if (n < 4) return out;
+    u64 rem = n;
+    vector<u64> pf;
+    static constexpr u64 sp[] = {2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97};
+    for (u64 p : sp) {
+        while (rem % p == 0) { pf.push_back(p); rem /= p; }
+    }
+    if (rem > 1) factor64_rec(rem, pf, 0);
+    sort(pf.begin(), pf.end());
+    vector<u64> divs = {1};
+    for (size_t i = 0; i < pf.size();) {
+        size_t j = i;
+        while (j < pf.size() && pf[j] == pf[i]) j++;
+        u64 p = pf[i];
+        int cnt = (int)(j - i);
+        size_t sz = divs.size();
+        for (size_t k = 0; k < sz; k++) {
+            u64 cur = divs[k];
+            for (int e = 1; e <= cnt; e++) {
+                cur *= p;
+                if (divs.size() < 512) divs.push_back(cur);
+            }
+        }
+        i = j;
+    }
+    for (u64 d : divs) {
+        if (d > 1 && d <= n / d) {
+            out.emplace_back(d, n / d);
+            if (out.size() >= max_pairs) break;
+        }
+    }
+    return out;
+}
+
 struct Step { char op; u64 a, b, r; };
 struct Instr { char op; int i, j, d; };
 
@@ -991,11 +1117,9 @@ struct KnockoutEnv {
         }
     }
 
-    // Fast bitset closure over `allowed` (up to 384 nodes -> 6 u64s)
-    bool close_bitset(const array<u64, 6> &allowed, array<u64, 6> &seen,
-                      const ViaRule *extra1 = nullptr, const ViaRule *extra2 = nullptr) const {
-        seen = {};
-        for (int s = 0; s < ks; s++) seen[s >> 6] |= (1ULL << (s & 63));
+    // Incremental bitset closure over `allowed` starting from caller-provided `seen`
+    bool close_bitset_from(const array<u64, 6> &allowed, array<u64, 6> &seen,
+                           const vector<const ViaRule *> *extras = nullptr) const {
         bool prog = true;
         while (prog) {
             prog = false;
@@ -1003,11 +1127,14 @@ struct KnockoutEnv {
                 u64 mask = 1ULL << (v & 63);
                 int w = v >> 6;
                 if (!(allowed[w] & mask) || (seen[w] & mask)) continue;
-                if (extra1 && extra1->target_v == v && (seen[extra1->other_c >> 6] & (1ULL << (extra1->other_c & 63)))) {
-                    seen[w] |= mask; prog = true; continue;
-                }
-                if (extra2 && extra2->target_v == v && (seen[extra2->other_c >> 6] & (1ULL << (extra2->other_c & 63)))) {
-                    seen[w] |= mask; prog = true; continue;
+                bool unlocked = false;
+                if (extras) {
+                    for (const ViaRule *vr : *extras) {
+                        if (vr->target_v == v && (seen[vr->other_c >> 6] & (1ULL << (vr->other_c & 63)))) {
+                            seen[w] |= mask; prog = true; unlocked = true; break;
+                        }
+                    }
+                    if (unlocked) continue;
                 }
                 for (const auto &e : dir_edges[v]) {
                     if ((seen[e.a >> 6] & (1ULL << (e.a & 63))) &&
@@ -1025,7 +1152,18 @@ struct KnockoutEnv {
         return false;
     }
 
-    // Reconstruct DAG after winning ban_set + 0..2 ViaRules
+    // Fast bitset closure over `allowed` (up to 384 nodes -> 6 u64s)
+    bool close_bitset(const array<u64, 6> &allowed, array<u64, 6> &seen,
+                      const ViaRule *extra1 = nullptr, const ViaRule *extra2 = nullptr) const {
+        seen = {};
+        for (int s = 0; s < ks; s++) seen[s >> 6] |= (1ULL << (s & 63));
+        vector<const ViaRule *> ex;
+        if (extra1) ex.push_back(extra1);
+        if (extra2) ex.push_back(extra2);
+        return close_bitset_from(allowed, seen, ex.empty() ? nullptr : &ex);
+    }
+
+    // Reconstruct DAG after winning ban_set + ViaRules + Bridges
     bool build_dag(const array<u64, 6> &allowed, const vector<pair<int, BridgeWitness>> &new_b,
                    const vector<ViaRule> &vias, const vector<u64> &pref_ord, Dag &out) const {
         array<u64, 6> seen{};
@@ -1033,7 +1171,7 @@ struct KnockoutEnv {
         unordered_map<u64, Step> defs;
         for (const auto &[bi, bw] : new_b) {
             u64 hv = bridges[bi].val;
-            defs[hv] = {bw.op, vals[bw.a], vals[bw.b], hv};
+            if (!defs.count(hv)) defs[hv] = {bw.op, vals[bw.a], vals[bw.b], hv};
         }
         bool prog = true;
         while (prog) {
@@ -1047,7 +1185,7 @@ struct KnockoutEnv {
                     if ((seen[e.a >> 6] & (1ULL << (e.a & 63))) &&
                         (seen[e.b >> 6] & (1ULL << (e.b & 63)))) {
                         seen[w] |= mask;
-                        defs[vals[v]] = {e.op, vals[e.a], vals[e.b], vals[v]};
+                        if (!defs.count(vals[v])) defs[vals[v]] = {e.op, vals[e.a], vals[e.b], vals[v]};
                         prog = true; fired = true; break;
                     }
                 }
@@ -1056,7 +1194,9 @@ struct KnockoutEnv {
                         if (vr.target_v == v && (seen[vr.other_c >> 6] & (1ULL << (vr.other_c & 63)))) {
                             u64 hv = bridges[vr.bridge_idx].val, cv = vals[vr.other_c];
                             seen[w] |= mask;
-                            defs[vals[v]] = vr.bridge_on_left ? Step{vr.op, hv, cv, vals[v]} : Step{vr.op, cv, hv, vals[v]};
+                            if (!defs.count(vals[v])) {
+                                defs[vals[v]] = vr.bridge_on_left ? Step{vr.op, hv, cv, vals[v]} : Step{vr.op, cv, hv, vals[v]};
+                            }
                             prog = true; break;
                         }
                     }
@@ -1077,9 +1217,313 @@ struct KnockoutEnv {
         return -1;
     }
 
-    // Try 0 or 1 bridge to repair `allowed` with banned nodes; also collect neutral swaps if `neut_out` non-null
+    // Reconstruct DAG when replacing dom_cut[u] by `extra_steps` producing `vals[u]` from `seen_free`
+    bool build_from_cone(int u, const array<u64, 6> &al_cut, const array<u64, 6> &seen_free,
+                         const vector<Step> &extra_steps, const vector<u64> &pref_ord, Dag &out) const {
+        unordered_map<u64, Step> defs;
+        defs.reserve(n + 8);
+        array<u64, 6> seen{};
+        for (int s = 0; s < ks; s++) seen[s >> 6] |= (1ULL << (s & 63));
+        bool prog = true;
+        while (prog) {
+            prog = false;
+            for (int v = ks; v < n; v++) {
+                u64 mask = 1ULL << (v & 63);
+                int w = v >> 6;
+                if (!(al_cut[w] & mask) || (seen[w] & mask)) continue;
+                for (const auto &e : dir_edges[v]) {
+                    if ((seen[e.a >> 6] & (1ULL << (e.a & 63))) &&
+                        (seen[e.b >> 6] & (1ULL << (e.b & 63)))) {
+                        seen[w] |= mask;
+                        defs[vals[v]] = {e.op, vals[e.a], vals[e.b], vals[v]};
+                        prog = true; break;
+                    }
+                }
+            }
+        }
+        for (const Step &st : extra_steps) {
+            bool is_s = false;
+            for (int s = 0; s < ks; s++) if (vals[s] == st.r) { is_s = true; break; }
+            if (is_s) return false;
+            // Avoid colliding with unreached downstream values (not u) to guarantee acyclicity
+            auto it = dag.val2idx.find(st.r);
+            if (it != dag.val2idx.end() && it->second != u && !(seen_free[it->second >> 6] & (1ULL << (it->second & 63)))) {
+                return false;
+            }
+            if (st.r == vals[u] || !defs.count(st.r)) defs[st.r] = st;
+        }
+        if (!defs.count(vals[u])) return false;
+        array<u64, 6> al_with_u = al_cut;
+        al_with_u[u >> 6] |= (1ULL << (u & 63));
+        seen[u >> 6] |= (1ULL << (u & 63));
+        prog = true;
+        while (prog) {
+            prog = false;
+            for (int v = ks; v < n; v++) {
+                u64 mask = 1ULL << (v & 63);
+                int w = v >> 6;
+                if (!(al_with_u[w] & mask) || (seen[w] & mask)) continue;
+                for (const auto &e : dir_edges[v]) {
+                    if ((seen[e.a >> 6] & (1ULL << (e.a & 63))) &&
+                        (seen[e.b >> 6] & (1ULL << (e.b & 63)))) {
+                        seen[w] |= mask;
+                        if (!defs.count(vals[v])) defs[vals[v]] = {e.op, vals[e.a], vals[e.b], vals[v]};
+                        prog = true; break;
+                    }
+                }
+            }
+        }
+        for (int ti : targets_idx) {
+            if (!(seen[ti >> 6] & (1ULL << (ti & 63)))) return false;
+        }
+        out.init(pz.L, pz.s, pz.t);
+        return out.from_defs(defs, pref_ord);
+    }
+
+    // Shared-bottleneck / private-cone 2/3/4-step rebuild + Pollard-Rho factoring
+    bool try_cone_rebuild(int u, const vector<u64> &pref_ord, Dag &win_dag,
+                          vector<Dag> *neut_out, int max_neut,
+                          vector<Dag> *uphill_out, int max_uphill,
+                          bool deep_neutral, double deadline) const {
+        if (now_sec() >= deadline) return false;
+        int c = (int)dom_cut[u].size();
+        if (c < 1 || c > 18) return false;
+
+        bool want_neut = (neut_out && (int)neut_out->size() < max_neut);
+        bool want_up = (uphill_out && (int)uphill_out->size() < max_uphill);
+        int max_steps = 0;
+        if (c >= 2) max_steps = max(max_steps, min(4, c - 1));
+        if (want_neut) max_steps = max(max_steps, min(4, c));
+        if (want_up) max_steps = max(max_steps, min(3, c + 1));
+        if (max_steps == 0) return false;
+
+        array<u64, 6> al_cut{};
+        for (int i = 0; i < n; i++) al_cut[i >> 6] |= (1ULL << (i & 63));
+        for (int x : dom_cut[u]) al_cut[x >> 6] &= ~(1ULL << (x & 63));
+
+        array<u64, 6> seen_free{};
+        close_bitset(al_cut, seen_free);
+
+        // Verify restoring u alone unlocks all targets
+        array<u64, 6> chk = seen_free, al_u = al_cut;
+        al_u[u >> 6] |= (1ULL << (u & 63));
+        chk[u >> 6] |= (1ULL << (u & 63));
+        if (!close_bitset_from(al_u, chk)) return false;
+
+        auto record = [&](Dag &td) -> bool {
+            if (td.len() < dag.len()) {
+                win_dag = move(td);
+                return true;
+            }
+            if (neut_out && td.len() == dag.len() && (int)neut_out->size() < max_neut) {
+                if (td.hash_dag() != dag.hash_dag()) neut_out->push_back(move(td));
+            } else if (uphill_out && td.len() == dag.len() + 1 && (int)uphill_out->size() < max_uphill) {
+                if (td.hash_dag() != dag.hash_dag()) uphill_out->push_back(move(td));
+            }
+            return false;
+        };
+        auto emit_steps = [&](const vector<Step> &extra) -> bool {
+            Dag td;
+            if (!build_from_cone(u, al_cut, seen_free, extra, pref_ord, td)) return false;
+            return record(td);
+        };
+
+        u64 T = vals[u];
+        // s = 1
+        if (c >= 2) {
+            for (const auto &e : dir_edges[u]) {
+                if ((seen_free[e.a >> 6] & (1ULL << (e.a & 63))) &&
+                    (seen_free[e.b >> 6] & (1ULL << (e.b & 63)))) {
+                    if (emit_steps({{e.op, vals[e.a], vals[e.b], T}})) return true;
+                }
+            }
+        }
+        // s = 2 (bridge + seen_free via)
+        if (max_steps >= 2 && (c >= 3 || want_neut || want_up)) {
+            int tried2 = 0;
+            for (const auto &vr : via_for_v[u]) {
+                if (!(seen_free[vr.other_c >> 6] & (1ULL << (vr.other_c & 63)))) continue;
+                int wi = active_witness(vr.bridge_idx, seen_free);
+                if (wi < 0) continue;
+                const auto &bw = bridges[vr.bridge_idx].wits[wi];
+                u64 hv = bridges[vr.bridge_idx].val, cv = vals[vr.other_c];
+                Step s1{bw.op, vals[bw.a], vals[bw.b], hv};
+                Step s2 = vr.bridge_on_left ? Step{vr.op, hv, cv, T} : Step{vr.op, cv, hv, T};
+                if (emit_steps({s1, s2})) return true;
+                if (c <= 2 && ++tried2 >= 6 && !(c <= 2 && want_up && !want_neut)) break;
+            }
+        }
+        if (max_steps < 3 || now_sec() >= deadline) return false;
+        bool want_s3_win = (c >= 4);
+        bool want_s3_aux = (deep_neutral && c == 3 && want_neut) || (deep_neutral && c == 2 && want_up && !want_neut);
+        bool want_s4_win = (max_steps >= 4 && c >= 5);
+        bool want_s4_neut = (max_steps >= 4 && deep_neutral && c == 4 && want_neut);
+        if (!want_s3_win && !want_s3_aux && !want_s4_win && !want_s4_neut) return false;
+
+        // Gather active bridges & F_vals from seen_free
+        struct ActB { u64 val; int bi; u8 wi; };
+        vector<ActB> act_b;
+        act_b.reserve(bridges.size() / 2 + 16);
+        unordered_map<u64, int> act_map;
+        act_map.reserve(bridges.size() + 32);
+        for (int bi = 0; bi < (int)bridges.size(); bi++) {
+            int wi = active_witness(bi, seen_free);
+            if (wi >= 0) {
+                int idx = (int)act_b.size();
+                act_b.push_back({bridges[bi].val, bi, (u8)wi});
+                act_map[bridges[bi].val] = idx;
+            }
+        }
+        if (act_b.empty()) return false;
+        sort(act_b.begin(), act_b.end(), [](const ActB &a, const ActB &b) { return a.val < b.val; });
+        for (int idx = 0; idx < (int)act_b.size(); idx++) act_map[act_b[idx].val] = idx;
+
+        auto make_bstep = [&](int aidx) -> Step {
+            const auto &ab = act_b[aidx];
+            const auto &bw = bridges[ab.bi].wits[ab.wi];
+            return Step{bw.op, vals[bw.a], vals[bw.b], ab.val};
+        };
+
+        vector<u64> F_vals;
+        F_vals.reserve(n);
+        for (int x = 0; x < n; x++) {
+            if (seen_free[x >> 6] & (1ULL << (x & 63))) F_vals.push_back(vals[x]);
+        }
+        sort(F_vals.begin(), F_vals.end());
+        F_vals.erase(unique(F_vals.begin(), F_vals.end()), F_vals.end());
+
+        // s = 3a: h1 op h2 == T (including Pollard-Rho factoring for h1 * h2 == T!)
+        if (want_s3_win || want_s3_aux) {
+            for (size_t i = 0; i < act_b.size(); i++) {
+                u64 h1 = act_b[i].val;
+                if (h1 <= T / 2) {
+                    u64 h2 = T - h1;
+                    if (h2 > 0) {
+                        auto it = act_map.find(h2);
+                        if (it != act_map.end() && it->second != (int)i) {
+                            if (emit_steps({make_bstep((int)i), make_bstep(it->second), {'+', h1, h2, T}})) return true;
+                        }
+                    }
+                }
+                if (h1 <= pz.L - T) {
+                    auto it = act_map.find(T + h1);
+                    if (it != act_map.end()) {
+                        if (emit_steps({make_bstep(it->second), make_bstep((int)i), {'-', T + h1, h1, T}})) return true;
+                    }
+                }
+                if (h1 > 1 && (u128)T * h1 <= (u128)pz.L) {
+                    u64 h2 = T * h1;
+                    auto it = act_map.find(h2);
+                    if (it != act_map.end()) {
+                        if (emit_steps({make_bstep(it->second), make_bstep((int)i), {'/', h2, h1, T}})) return true;
+                    }
+                }
+                if (want_s3_aux && (neut_out && (int)neut_out->size() >= max_neut) && !want_s3_win) break;
+            }
+            // Pollard-Rho divisor pairs (d1 * d2 == T)
+            if (T >= 4 && now_sec() < deadline) {
+                auto dpairs = get_divisor_pairs(T, 256);
+                for (auto [d1, d2] : dpairs) {
+                    auto it1 = act_map.find(d1), it2 = act_map.find(d2);
+                    if (it1 != act_map.end() && it2 != act_map.end()) {
+                        if (emit_steps({make_bstep(it1->second), make_bstep(it2->second), {'*', d1, d2, T}})) return true;
+                    }
+                }
+            }
+        }
+
+        // Precompute y = inv(T, d) for d in F_vals (needed for s = 3b and s = 4)
+        struct YCand { u64 y, f; char op; u8 y_left; };
+        vector<YCand> y_list;
+        unordered_map<u64, int> y_map;
+        auto push_y = [&](u64 y, char op, u64 f, u8 y_left) {
+            if (y == 0 || y > pz.L) return;
+            if (!y_map.count(y)) {
+                y_map[y] = (int)y_list.size();
+                y_list.push_back({y, f, op, y_left});
+            }
+        };
+        for (u64 f : F_vals) {
+            if (T > f) push_y(T - f, '+', f, 1);
+            if (f <= pz.L - T) push_y(T + f, '-', f, 1);
+            if (f > T) push_y(f - T, '-', f, 0);
+            if (f > 1 && T % f == 0) push_y(T / f, '*', f, 1);
+            if (f > 1 && (u128)T * f <= (u128)pz.L) push_y(T * f, '/', f, 1);
+            if (f > T && f % T == 0) push_y(f / T, '/', f, 0);
+        }
+
+        // s = 3b: (h op2 c) op3 f == T where c, f in F_vals, h in act_map
+        if ((want_s3_win || want_s3_aux) && !y_list.empty() && now_sec() < deadline) {
+            size_t clim = want_s3_win ? F_vals.size() : min<size_t>(F_vals.size(), 64);
+            for (const auto &yc : y_list) {
+                u64 y = yc.y;
+                Step s3 = yc.y_left ? Step{yc.op, y, yc.f, T} : Step{yc.op, yc.f, y, T};
+                for (size_t ci = 0; ci < clim; ci++) {
+                    u64 cval = F_vals[ci];
+                    auto check_h = [&](u64 h, char op2, bool h_left) -> bool {
+                        if (h == 0 || h > pz.L) return false;
+                        auto it = act_map.find(h);
+                        if (it == act_map.end()) return false;
+                        Step s1 = make_bstep(it->second);
+                        Step s2 = h_left ? Step{op2, h, cval, y} : Step{op2, cval, h, y};
+                        return emit_steps({s1, s2, s3});
+                    };
+                    if (y > cval && check_h(y - cval, '+', true)) return true;
+                    if (cval <= pz.L - y && check_h(y + cval, '-', true)) return true;
+                    if (cval > y && check_h(cval - y, '-', false)) return true;
+                    if (cval > 1 && y % cval == 0 && check_h(y / cval, '*', true)) return true;
+                    if (cval > 1 && (u128)y * cval <= (u128)pz.L && check_h(y * cval, '/', true)) return true;
+                    if (cval > y && cval % y == 0 && check_h(cval / y, '/', false)) return true;
+                }
+                if (want_s3_aux && !want_s3_win && (!want_neut || (int)neut_out->size() >= max_neut)) break;
+            }
+        }
+
+        // s = 4: ((a op1 b) op2 (c op3 d)) op4 f == T over small_b <= 260 + Pollard-Rho factored y_list
+        if ((want_s4_win || want_s4_neut) && !y_list.empty() && now_sec() < deadline) {
+            size_t slim = min<size_t>(act_b.size(), want_s4_win ? 280 : 140);
+            for (size_t i = 0; i < slim && now_sec() < deadline; i++) {
+                u64 h1 = act_b[i].val;
+                for (size_t j = i + 1; j < slim; j++) {
+                    u64 h2 = act_b[j].val;
+                    auto try_val = [&](u64 y, char op2, u64 a, u64 b) -> bool {
+                        auto it = y_map.find(y);
+                        if (it == y_map.end()) return false;
+                        const auto &yc = y_list[it->second];
+                        Step s3{op2, a, b, y};
+                        Step s4 = yc.y_left ? Step{yc.op, y, yc.f, T} : Step{yc.op, yc.f, y, T};
+                        return emit_steps({make_bstep((int)i), make_bstep((int)j), s3, s4});
+                    };
+                    if (h1 <= pz.L - h2 && try_val(h1 + h2, '+', h1, h2)) return true;
+                    if ((u128)h1 * h2 <= (u128)pz.L && try_val(h1 * h2, '*', h1, h2)) return true;
+                    if (h2 > h1 && try_val(h2 - h1, '-', h2, h1)) return true;
+                    if (h1 > 1 && h2 % h1 == 0 && try_val(h2 / h1, '/', h2, h1)) return true;
+                }
+            }
+            // Also factored y = d1 * d2 in act_map for large factors beyond small_b
+            size_t ylim = min<size_t>(y_list.size(), want_s4_win ? 140 : 48);
+            for (size_t yi = 0; yi < ylim && now_sec() < deadline; yi++) {
+                const auto &yc = y_list[yi];
+                if (yc.y < 4) continue;
+                auto dpairs = get_divisor_pairs(yc.y, 128);
+                for (auto [d1, d2] : dpairs) {
+                    auto it1 = act_map.find(d1), it2 = act_map.find(d2);
+                    if (it1 != act_map.end() && it2 != act_map.end() && it1->second != it2->second) {
+                        Step s3{'*', d1, d2, yc.y};
+                        Step s4 = yc.y_left ? Step{yc.op, yc.y, yc.f, T} : Step{yc.op, yc.f, yc.y, T};
+                        if (emit_steps({make_bstep(it1->second), make_bstep(it2->second), s3, s4})) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // Try 0, 1, or 2 bridges to repair `allowed` with banned nodes; collect neutral & +1 uphill neighbors
     bool repair_ban(const array<u64, 6> &allowed, int ban_cnt, const vector<u64> &pref_ord,
-                    Dag &win_dag, vector<Dag> *neut_out = nullptr, int max_neut = 4) const {
+                    Dag &win_dag, vector<Dag> *neut_out = nullptr, int max_neut = 4,
+                    vector<Dag> *uphill_out = nullptr, int max_uphill = 4,
+                    double deadline = 1e18) const {
         array<u64, 6> seen{};
         if (close_bitset(allowed, seen)) {
             Dag td;
@@ -1090,8 +1534,7 @@ struct KnockoutEnv {
             return false;
         }
         if (ban_cnt < 1) return false;
-        // Collect candidate ViaRules on unreached nodes whose `other_c` IS in `seen` and bridge witness IS in `seen`
-        // Notice we prioritize unreached nodes that are targets or have highest fanout!
+
         unordered_map<int, vector<const ViaRule *>> by_bridge;
         for (int v = ks; v < n; v++) {
             if (!(allowed[v >> 6] & (1ULL << (v & 63)))) continue;
@@ -1102,22 +1545,29 @@ struct KnockoutEnv {
                 by_bridge[vr.bridge_idx].push_back(&vr);
             }
         }
-        // Try unlocking with 1 bridge! (Either 1 ViaRule or multiple ViaRules sharing the SAME bridge_idx!)
-        // Wait: when 1 bridge h unlocks multiple unreached v's, pass the two highest-priority ViaRules or allow h in close!
         vector<pair<int, vector<const ViaRule *>>> cands;
         cands.reserve(by_bridge.size());
         for (auto &[bi, vrs] : by_bridge) cands.emplace_back(bi, move(vrs));
         sort(cands.begin(), cands.end(), [](const auto &A, const auto &B) { return A.second.size() > B.second.size(); });
 
+        bool want_neut = (neut_out && (int)neut_out->size() < max_neut);
+        bool want_up = (uphill_out && (int)uphill_out->size() < max_uphill);
+        bool need_2bridge = (ban_cnt >= 3) || (ban_cnt == 2 && want_neut) || (ban_cnt == 1 && want_up);
+
+        struct Partial {
+            int bi1, wi1;
+            vector<const ViaRule *> vrs1;
+            array<u64, 6> seen2;
+        };
+        vector<Partial> partials;
+
         for (const auto &[bi, vrs] : cands) {
             int wi = active_witness(bi, seen);
             if (wi < 0) continue;
-            // Test with vrs[0] (and vrs[1] if >=2 unlocked nodes)
-            const ViaRule *e1 = vrs[0];
-            const ViaRule *e2 = (vrs.size() >= 2 ? vrs[1] : nullptr);
-            array<u64, 6> seen2{};
-            if (close_bitset(allowed, seen2, e1, e2)) {
+            array<u64, 6> seen2 = seen;
+            if (close_bitset_from(allowed, seen2, &vrs)) {
                 vector<ViaRule> used_vrs;
+                used_vrs.reserve(vrs.size());
                 for (const ViaRule *vp : vrs) used_vrs.push_back(*vp);
                 Dag td;
                 if (build_dag(allowed, {{bi, bridges[bi].wits[wi]}}, used_vrs, pref_ord, td)) {
@@ -1129,6 +1579,59 @@ struct KnockoutEnv {
                         if (td.hash_dag() != dag.hash_dag()) neut_out->push_back(move(td));
                     }
                 }
+            } else if (need_2bridge && (int)partials.size() < 16) {
+                partials.push_back({bi, wi, vrs, seen2});
+            }
+        }
+
+        // 2-bridge {h1, h2} quartet closure
+        if (need_2bridge && !partials.empty() && now_sec() < deadline) {
+            for (const auto &pt : partials) {
+                if (now_sec() >= deadline) break;
+                unordered_map<int, vector<const ViaRule *>> by_b2;
+                for (int v = ks; v < n; v++) {
+                    if (!(allowed[v >> 6] & (1ULL << (v & 63)))) continue;
+                    if (pt.seen2[v >> 6] & (1ULL << (v & 63))) continue;
+                    for (const auto &vr : via_for_v[v]) {
+                        if (vr.bridge_idx == pt.bi1) continue;
+                        if (!(pt.seen2[vr.other_c >> 6] & (1ULL << (vr.other_c & 63)))) continue;
+                        if (active_witness(vr.bridge_idx, pt.seen2) < 0) continue;
+                        by_b2[vr.bridge_idx].push_back(&vr);
+                    }
+                }
+                if (by_b2.empty()) continue;
+                vector<pair<int, vector<const ViaRule *>>> cands2;
+                cands2.reserve(by_b2.size());
+                for (auto &[bi2, vrs2] : by_b2) cands2.emplace_back(bi2, move(vrs2));
+                sort(cands2.begin(), cands2.end(), [](const auto &A, const auto &B) { return A.second.size() > B.second.size(); });
+                size_t lim2 = min<size_t>(cands2.size(), 8);
+                for (size_t k2 = 0; k2 < lim2; k2++) {
+                    int bi2 = cands2[k2].first;
+                    const auto &vrs2 = cands2[k2].second;
+                    int wi2 = active_witness(bi2, pt.seen2);
+                    if (wi2 < 0) continue;
+                    array<u64, 6> seen3 = pt.seen2;
+                    if (close_bitset_from(allowed, seen3, &vrs2)) {
+                        vector<ViaRule> used_vrs;
+                        used_vrs.reserve(pt.vrs1.size() + vrs2.size());
+                        for (const ViaRule *vp : pt.vrs1) used_vrs.push_back(*vp);
+                        for (const ViaRule *vp : vrs2) used_vrs.push_back(*vp);
+                        Dag td;
+                        if (build_dag(allowed, {{pt.bi1, bridges[pt.bi1].wits[pt.wi1]}, {bi2, bridges[bi2].wits[wi2]}}, used_vrs, pref_ord, td)) {
+                            if (td.len() < dag.len()) {
+                                win_dag = move(td);
+                                return true;
+                            }
+                            if (neut_out && td.len() == dag.len() && (int)neut_out->size() < max_neut) {
+                                if (td.hash_dag() != dag.hash_dag()) neut_out->push_back(move(td));
+                                if (ban_cnt < 3) break;
+                            } else if (uphill_out && td.len() == dag.len() + 1 && (int)uphill_out->size() < max_uphill) {
+                                if (td.hash_dag() != dag.hash_dag()) uphill_out->push_back(move(td));
+                                if (ban_cnt == 1) break;
+                            }
+                        }
+                    }
+                }
             }
         }
         return false;
@@ -1137,8 +1640,10 @@ struct KnockoutEnv {
 
 static bool solve_knockout_once(const Puzzle &pz, Dag &cur, vector<Instr> &best_prog,
                                 vector<u64> &pref_ord, mt19937_64 &rng,
-                                vector<Dag> *neut_archive = nullptr) {
-    if ((int)cur.nodes.size() > 380) return false;
+                                vector<Dag> *neut_archive = nullptr,
+                                vector<Dag> *uphill_archive = nullptr,
+                                double deadline = 1e18, bool deep_neutral = false) {
+    if ((int)cur.nodes.size() > 384 || now_sec() >= deadline) return false;
     KnockoutEnv env(pz, cur);
     array<u64, 6> all_ok{};
     for (int i = 0; i < env.n; i++) all_ok[i >> 6] |= (1ULL << (i & 63));
@@ -1155,29 +1660,52 @@ static bool solve_knockout_once(const Puzzle &pz, Dag &cur, vector<Instr> &best_
     };
 
     Dag win_dag;
-    // 1. Single-node bans (both 0-bridge reductions AND neutral swaps) & dominated-subtree cuts
+    // 1. Single-node bans (0/1/2-bridge) & dominated-subtree cuts
     for (int u = env.ks; u < env.n; u++) {
+        if (now_sec() >= deadline) return false;
         if (!env.is_target[u]) {
             auto al = all_ok;
             al[u >> 6] &= ~(1ULL << (u & 63));
-            if (env.repair_ban(al, 1, pref_ord, win_dag, neut_archive, 8)) {
+            if (env.repair_ban(al, 1, pref_ord, win_dag, neut_archive, 8, uphill_archive, 6, deadline)) {
                 if (accept_dag(win_dag, "1ban")) return true;
             }
         }
         if (env.dom_cut[u].size() >= 2 && env.dom_cut[u].size() <= 16) {
-            bool has_t = false;
-            for (int x : env.dom_cut[u]) if (env.is_target[x]) { has_t = true; break; }
-            if (!has_t) {
+            bool has_other_t = false;
+            for (int x : env.dom_cut[u]) if (x != u && env.is_target[x]) { has_other_t = true; break; }
+            if (!has_other_t && !env.is_target[u]) {
                 auto al = all_ok;
                 for (int x : env.dom_cut[u]) al[x >> 6] &= ~(1ULL << (x & 63));
-                if (env.repair_ban(al, (int)env.dom_cut[u].size(), pref_ord, win_dag)) {
+                if (env.repair_ban(al, (int)env.dom_cut[u].size(), pref_ord, win_dag, neut_archive, 8, uphill_archive, 6, deadline)) {
                     if (accept_dag(win_dag, "cut")) return true;
                 }
             }
         }
     }
 
-    // 2. Pair bans (2-ban + <=1 bridge): connected pairs (shared parent/consumer or edge) + top shared nodes
+    // 1b. Shared-bottleneck / target-cone 2/3/4-step rebuild + Pollard-Rho factoring (largest dom_cut first)
+    {
+        vector<int> cone_nodes;
+        cone_nodes.reserve(env.n - env.ks);
+        for (int u = env.ks; u < env.n; u++) {
+            bool has_other_t = false;
+            for (int x : env.dom_cut[u]) if (x != u && env.is_target[x]) { has_other_t = true; break; }
+            if (!has_other_t && !env.dom_cut[u].empty()) cone_nodes.push_back(u);
+        }
+        sort(cone_nodes.begin(), cone_nodes.end(), [&](int a, int b) {
+            if (env.dom_cut[a].size() != env.dom_cut[b].size())
+                return env.dom_cut[a].size() > env.dom_cut[b].size();
+            return env.fanout[a] > env.fanout[b];
+        });
+        for (int u : cone_nodes) {
+            if (now_sec() >= deadline) return false;
+            if (env.try_cone_rebuild(u, pref_ord, win_dag, neut_archive, 10, uphill_archive, 8, deep_neutral, deadline)) {
+                if (accept_dag(win_dag, "cone")) return true;
+            }
+        }
+    }
+
+    // 2. Pair bans (2-ban + 0/1/2-bridge): connected pairs (shared parent/consumer or edge) + top shared nodes
     vector<pair<int, int>> pairs;
     vector<int> non_ts;
     for (int u = env.ks; u < env.n; u++) if (!env.is_target[u]) non_ts.push_back(u);
@@ -1200,7 +1728,6 @@ static bool solve_knockout_once(const Puzzle &pz, Dag &cur, vector<Instr> &best_
                 for (size_t y = x + 1; y < env.users[u].size() && y < 16; y++)
                     add_p(env.users[u][x], env.users[u][y]);
         }
-        // Also all pairs among top-40 fanout<=4 recent nodes
         vector<int> f_nodes = non_ts;
         sort(f_nodes.begin(), f_nodes.end(), [&](int a, int b) { return env.fanout[a] < env.fanout[b]; });
         size_t lim = min<size_t>(f_nodes.size(), 45);
@@ -1208,19 +1735,22 @@ static bool solve_knockout_once(const Puzzle &pz, Dag &cur, vector<Instr> &best_
             for (size_t j = i + 1; j < lim; j++)
                 add_p(f_nodes[i], f_nodes[j]);
     }
-    for (auto [u1, u2] : pairs) {
+    for (size_t pi = 0; pi < pairs.size(); pi++) {
+        if ((pi & 31) == 0 && now_sec() >= deadline) return false;
+        auto [u1, u2] = pairs[pi];
         auto al = all_ok;
         al[u1 >> 6] &= ~(1ULL << (u1 & 63));
         al[u2 >> 6] &= ~(1ULL << (u2 & 63));
-        if (env.repair_ban(al, 2, pref_ord, win_dag)) {
+        if (env.repair_ban(al, 2, pref_ord, win_dag, neut_archive, 8, nullptr, 0, deadline)) {
             if (accept_dag(win_dag, "2ban")) return true;
         }
     }
 
-    // 3. Connected triple bans (3-ban + <=1 bridge)
+    // 3. Connected triple bans (3-ban + 0/1/2-bridge -> 2-bridge wins -1!)
     vector<int> low_fan;
     for (int u : non_ts) if (env.fanout[u] <= 3) low_fan.push_back(u);
     for (int u : low_fan) {
+        if (now_sec() >= deadline) return false;
         vector<int> nbrs;
         auto push_n = [&](int x) {
             if (x >= env.ks && !env.is_target[x] && x != u) nbrs.push_back(x);
@@ -1231,11 +1761,12 @@ static bool solve_knockout_once(const Puzzle &pz, Dag &cur, vector<Instr> &best_
         nbrs.erase(unique(nbrs.begin(), nbrs.end()), nbrs.end());
         for (size_t i = 0; i < nbrs.size(); i++) {
             for (size_t j = i + 1; j < nbrs.size(); j++) {
+                if (now_sec() >= deadline) return false;
                 auto al = all_ok;
                 al[u >> 6] &= ~(1ULL << (u & 63));
                 al[nbrs[i] >> 6] &= ~(1ULL << (nbrs[i] & 63));
                 al[nbrs[j] >> 6] &= ~(1ULL << (nbrs[j] & 63));
-                if (env.repair_ban(al, 3, pref_ord, win_dag)) {
+                if (env.repair_ban(al, 3, pref_ord, win_dag, nullptr, 0, nullptr, 0, deadline)) {
                     if (accept_dag(win_dag, "3ban")) return true;
                 }
             }
@@ -1350,10 +1881,12 @@ int main(int argc, char **argv) {
 
             int p_x = 0, p_k = 0, p_w = 0;
 
-            // Pass 1: Multi-donor bitset crossover
+            // Pass 1: Multi-donor bitset crossover (up to 24 archive DAGs)
             if (archive.size() >= 2 && now_sec() < deadline) {
+                vector<Dag> sub_pool;
+                for (size_t k = 0; k < archive.size() && sub_pool.size() < 24; k++) sub_pool.push_back(archive[k]);
                 Dag xd; vector<Instr> xp;
-                if (run_crossover(pz, archive, best_ord, 800, (int)best_prog.size(), rng, xd, xp)) {
+                if (run_crossover(pz, sub_pool, best_ord, 800, (int)best_prog.size(), rng, xd, xp)) {
                     best_dag = move(xd);
                     best_prog = move(xp);
                     best_dag.from_prog(best_prog, &best_ord);
@@ -1363,68 +1896,138 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // Pass 2: Direct knockout on current best (greedy descent + harvest neutral backbones)
-            vector<Dag> work_q;
+            // Pass 2: Direct knockout + cone rebuild on current best (harvest neutral & +1 uphill neighbors)
+            vector<Dag> work_q, uphill_q;
             while (now_sec() < deadline) {
-                vector<Dag> neuts;
-                if (solve_knockout_once(pz, best_dag, best_prog, best_ord, rng, &neuts)) {
+                vector<Dag> neuts, ups;
+                if (solve_knockout_once(pz, best_dag, best_prog, best_ord, rng, &neuts, &ups, deadline, true)) {
                     p_k++; wins_knock++;
+                    work_q.clear();
+                    uphill_q.clear();
                     u64 h = best_dag.hash_dag();
-                    if (seen_hashes.insert(h).second && archive.size() < 32) archive.push_back(best_dag);
+                    if (seen_hashes.insert(h).second && archive.size() < 36) archive.push_back(best_dag);
                 } else {
                     for (auto &nd : neuts) {
                         u64 h = nd.hash_dag();
-                        if (seen_hashes.insert(h).second && work_q.size() < 24) {
-                            work_q.push_back(move(nd));
+                        if (seen_hashes.insert(h).second) {
+                            if (archive.size() < 36) archive.push_back(nd);
+                            if (work_q.size() < 28) work_q.push_back(move(nd));
+                        }
+                    }
+                    for (auto &ud : ups) {
+                        u64 h = ud.hash_dag();
+                        if (seen_hashes.insert(h).second && uphill_q.size() < 20) {
+                            uphill_q.push_back(move(ud));
                         }
                     }
                     break;
                 }
             }
 
-            // Pass 3: Neutral backbone walk + knockout on neighbors + archive crossover
-            int walk_step = 0;
-            while (now_sec() < deadline && (!work_q.empty() || walk_step < 12)) {
+            // Pass 3: Neutral backbone walk + persistent +1 uphill kicks + 24-DAG archive crossover
+            int walk_step = 0, no_imp_steps = 0;
+            bool kicked_base = false;
+            while (now_sec() < deadline && walk_step < 48) {
                 walk_step++;
-                if (work_q.empty()) break;
-                Dag cur_w = work_q[rng() % work_q.size()];
+                if (work_q.empty() && uphill_q.empty()) {
+                    if (kicked_base) break;
+                    kicked_base = true;
+                    vector<Dag> neuts, ups;
+                    solve_knockout_once(pz, best_dag, best_prog, best_ord, rng, &neuts, &ups, deadline, true);
+                    for (auto &nd : neuts) {
+                        u64 h = nd.hash_dag();
+                        if (seen_hashes.insert(h).second && work_q.size() < 28) work_q.push_back(move(nd));
+                    }
+                    for (auto &ud : ups) {
+                        u64 h = ud.hash_dag();
+                        if (seen_hashes.insert(h).second && uphill_q.size() < 20) uphill_q.push_back(move(ud));
+                    }
+                    if (work_q.empty() && uphill_q.empty()) break;
+                }
+
+                bool from_uphill = false;
+                Dag cur_w;
+                if (!uphill_q.empty() && (work_q.empty() || no_imp_steps >= 6 || (rng() % 4 == 0))) {
+                    from_uphill = true;
+                    size_t idx = rng() % uphill_q.size();
+                    cur_w = uphill_q[idx];
+                    if (no_imp_steps >= 6) no_imp_steps = 0;
+                } else {
+                    cur_w = work_q[rng() % work_q.size()];
+                }
+                no_imp_steps++;
+
                 vector<u64> w_ord = cur_w.node_order();
-                vector<Instr> dummy_prog(best_prog.size(), Instr{'+', 0, 0, 0});
-                vector<Dag> more_neuts;
-                if (solve_knockout_once(pz, cur_w, dummy_prog, w_ord, rng, &more_neuts)) {
-                    // Knockout found shorter DAG on neutral neighbor! Check zero-spill compile!
+                vector<Instr> w_prog(cur_w.len(), Instr{'+', 0, 0, 0});
+                vector<Dag> more_neuts, more_ups;
+                if (solve_knockout_once(pz, cur_w, w_prog, w_ord, rng, &more_neuts, &more_ups, deadline, false)) {
                     vector<Instr> cprog;
-                    if (cur_w.compile_zero_spill(cprog, rng, &w_ord, 8000) && (int)cprog.size() < (int)best_prog.size()) {
-                        best_dag = move(cur_w);
-                        best_prog = move(cprog);
-                        best_dag.from_prog(best_prog, &best_ord);
-                        p_w++; wins_walk++;
-                        archive.insert(archive.begin(), best_dag);
-                        work_q.clear();
-                        // Immediately descend again
-                        solve_knockout_once(pz, best_dag, best_prog, best_ord, rng, &more_neuts);
+                    if (cur_w.compile_zero_spill(cprog, rng, &w_ord, 8000)) {
+                        if ((int)cprog.size() < (int)best_prog.size()) {
+                            best_dag = move(cur_w);
+                            best_prog = move(cprog);
+                            best_dag.from_prog(best_prog, &best_ord);
+                            p_w++; wins_walk++;
+                            archive.insert(archive.begin(), best_dag);
+                            seen_hashes.insert(best_dag.hash_dag());
+                            work_q.clear();
+                            uphill_q.clear();
+                            no_imp_steps = 0;
+                            kicked_base = false;
+                            while (now_sec() < deadline) {
+                                vector<Dag> nds, uds;
+                                if (solve_knockout_once(pz, best_dag, best_prog, best_ord, rng, &nds, &uds, deadline, true)) {
+                                    p_k++; wins_knock++;
+                                    if (archive.size() < 36) archive.push_back(best_dag);
+                                } else {
+                                    for (auto &nd : nds) {
+                                        if (seen_hashes.insert(nd.hash_dag()).second && work_q.size() < 28) work_q.push_back(move(nd));
+                                    }
+                                    for (auto &ud : uds) {
+                                        if (seen_hashes.insert(ud.hash_dag()).second && uphill_q.size() < 20) uphill_q.push_back(move(ud));
+                                    }
+                                    break;
+                                }
+                            }
+                            continue;
+                        } else if (from_uphill && (int)cprog.size() == (int)best_prog.size()) {
+                            u64 h = cur_w.hash_dag();
+                            if (seen_hashes.insert(h).second) {
+                                if (archive.size() < 36) archive.push_back(cur_w);
+                                if (work_q.size() < 28) work_q.push_back(move(cur_w));
+                            }
+                        }
                     }
                 }
                 for (auto &nd : more_neuts) {
                     u64 h = nd.hash_dag();
-                    if (seen_hashes.insert(h).second) {
-                        if (archive.size() < 28) archive.push_back(nd);
-                        if (work_q.size() < 24) work_q.push_back(move(nd));
+                    if (seen_hashes.insert(h).second && nd.len() <= best_dag.len() + 1) {
+                        if (archive.size() < 36) archive.push_back(nd);
+                        if (nd.len() == best_dag.len() && work_q.size() < 28) work_q.push_back(move(nd));
+                        else if (nd.len() == best_dag.len() + 1 && uphill_q.size() < 20) uphill_q.push_back(move(nd));
+                    }
+                }
+                for (auto &ud : more_ups) {
+                    u64 h = ud.hash_dag();
+                    if (seen_hashes.insert(h).second && ud.len() == best_dag.len() + 1 && uphill_q.size() < 20) {
+                        uphill_q.push_back(move(ud));
                     }
                 }
                 if (walk_step % 4 == 0 && archive.size() >= 3 && now_sec() < deadline) {
                     vector<Dag> sub_pool = {best_dag};
-                    for (size_t k = 1; k < archive.size() && sub_pool.size() < 12; k++) {
+                    for (size_t k = 1; k < archive.size() && sub_pool.size() < 24; k++) {
                         if (archive[k].len() <= best_dag.len() + 3) sub_pool.push_back(archive[k]);
                     }
                     if (sub_pool.size() >= 2) {
                         Dag xd; vector<Instr> xp;
-                        if (run_crossover(pz, sub_pool, best_ord, 500, (int)best_prog.size(), rng, xd, xp)) {
+                        if (run_crossover(pz, sub_pool, best_ord, 600, (int)best_prog.size(), rng, xd, xp)) {
                             best_dag = move(xd);
                             best_prog = move(xp);
                             best_dag.from_prog(best_prog, &best_ord);
                             p_x++; wins_xover++;
                             archive.insert(archive.begin(), best_dag);
+                            seen_hashes.insert(best_dag.hash_dag());
+                            no_imp_steps = 0;
                         }
                     }
                 }
