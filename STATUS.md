@@ -33,40 +33,30 @@ of both our submissions exactly.
   * register allocator: rematerialisation-aware Belady, tries 4 schedule/seed modes, `-reorder N`
     hill-climbs target order to remove spills; reproduces every public program's length exactly;
   * modes: `-lns progs.txt -lsec S -lk K` (window LNS), `-dag file` (compile a DAG).
-* `cpp/elf2.cpp` next-gen engine (in development, E039–E040 baseline on 12-puzzle `bench12`): 5-engine `DeepSearch` (exact `<=4` MITM, `S01×S012`/`S2×S2` product-diff, 64-bit `T±C` factoring + 3-factor + S3-cofactor, target-diff/div wrappers, product-residual beam), peak-liveness scheduler + Belady fallback, `-construct`, `-lns`.
+* `cpp/elf2.cpp` next-gen engine (E039–E048): 5-engine `DeepSearch` (exact `<=4` MITM, `S01×S012`/`S2×S2`/`P1±P1`/`T±C` product-diff, 64-bit `T±C` factoring + 3-factor + S3-cofactor, target-diff/div wrappers, product-residual beam), minimal-perturbation peak-liveness scheduler (`eval_order`, bottleneck `fix_pressure_sa`, Kahn's + Belady fallback), hidden-base discovery + hub injection + live-pressure lookahead in `-construct` (with `-multi N`), E-graph + voted-hub `-pool` exporter, `-dag` compiler, `-lns`, and Soft-Peak Herfindahl DAG-SA (`-sa`).
 * `cpp/bases.cpp` hidden-base discovery (pairwise gcd of offset targets + binomial significance test).
 * `cpp/mitm_probe.cpp` exact depth<=7 reachability probe; `eda/` analyses; `scripts/` helpers.
 * `kaggle/push_shards.py` + `kaggle/run_kernel.py`: private dataset + private CPU kernels, one shard each
   (smoke-tested; `dataset`, `launch NAME N "ARGS" [p_all.txt] [shards]`, `status`, `fetch`).
 
 ## Where our engine stands (ratio = our length / public best; lower is better)
-| setting | sample | ratio |
+| engine / setting | sample | ratio |
 |---|---|---:|
-| greedy `-w 10 -n 88 -nd 72 -p 2` | 100 puzzles (every 10th) | 1.239 |
-| + lookahead `-la 6` | 20 puzzles | 1.214 |
-| with discovered bases as helper targets | 104 base puzzles | 1.395 -> 1.330 |
-| **best: `-w 30 -n 160 -nd 100 -la 12 -lalt 4 -lwidth 6 -p 1`** | 100 puzzles | **1.145** (0 wins) |
+| `elf.cpp` greedy `-w 10 -n 88 -nd 72 -p 2` | 100 puzzles (`every10`) | 1.239 |
+| `elf.cpp` best `-w 30 -n 160 -nd 100 -la 12 -lalt 4 -lwidth 6 -p 1` | 100 puzzles (`every10`) | 1.145 (0 wins) |
+| `elf2.cpp` `-construct 1 -t 11 -n 96` (E039) | `bench12` (`PUB=2,303`) | 1.162 (2,675) |
+| `elf2.cpp` `-construct 1 -n 160 -k2 64 -la 12 -lalt 6` (E043b) | `bench12` (`PUB=2,303`) | 1.093 (prog 2,518 / raw DAG 2,476 = 1.075) |
+| **`elf2.cpp` `-construct 1 -multi 4 -lsec 20` + `-sa` (E048)** | `bench12` (`PUB=2,303`) | **1.073** (prog **2,472**, raw DAG **2,463 = 1.069**, indep **1.042**) |
 
-Improvement passes on the public best found nothing: window LNS with our planner (k<=4 targets, 20 s per
-puzzle, 100 puzzles) and CP-SAT recombination of public + own programs (with and without a pool of all
-1-op recipes between pooled values) both return the public programs unchanged.
+What moved vs public:
+* `-pool` (algebraic E-graph rewrites + voted hubs) + 2-stage CP-SAT (`src/recombine.py`) found `elf2`'s first strict DAG reduction against `public_merge` (`scored_0002: 245 -> 244 opt`, E044/E044b/E044c/E045), though compiling `244` without spills remains blocked by 2 register spills across `PUB`'s 39 saturated `live==48` steps.
+* Fast L3-cache `-sa` (`88/24/100k`) cuts `-26` instructions in 30 s on our own `E043b` constructions (`2,518 -> 2,492`, E047c), but `public_merge` itself is locally saturated under `k<=4` LNS/SA (0 wins on `every10` in E046 & E047d).
 
 ## Assessment
-Our engine is ~15% behind the public frontier on a representative sample and has no per-puzzle wins.
-Public programs are planner output polished by many LNS passes (exchange, quartet, anneal,
-recombination), and those passes are saturated on the public frontier. The LB leader (128.3k, 4% ahead
-of public) must have a substantially stronger constructive method. Running public *code* is off the
-table for us (safety rule on executing downloaded code); public *programs* are fine as data.
+* Our constructive engine (`elf2.cpp`) has caught up dramatically from `1.145–1.162x` down to **`1.073x` overall and `1.042x` on 50–60b independent puzzles** from scratch, with `10/12` `bench12` puzzles compiling at zero spills.
+* `public_merge` (`133,772`, already produced by ~1,100+ CPU-hours of konbu17 portfolio + weeks of community LNS/annealing like `goodpjw2008`) has `617/1000` puzzles at `max_peak <= 44` and `193/1000` pinned at `max_peak == 48`, with `45.7%` of all instructions in `sh3+` backbones (`fanout >= 3`). Breaking past `133,772` meaningfully toward `#1` (`128,330`) requires stronger constructive search + true deeper/GPU MITM (`S3`, RTX 4050) + multi-start constructive portfolio + global helper discovery/recombination rather than local `k<=4` tweaks on fixed `PUB` DAGs.
 
 ## Next steps (in order)
-0. Refresh the public merge daily (`scripts/fetch_public.sh` + `src/merge.py`); so far the only source
-   of LB gains (133,928 -> 133,860 -> 133,785). Include notebook outputs (`kaggle kernels output`) of the
-   newest public notebooks; they are often ahead of the datasets.
-1. Build a strong LNS operator of our own that introduces *new* helper values for groups of 2-4 targets
-   (public "quartet"/helper moves are what took planner output ~6% lower; ours gains ~0.1%). Only with
-   such an operator can our diverse constructions compete per puzzle.
-2. Independent puzzles (242, ~47k): most likely where the leader's 4% comes from (structured puzzles look
-   close to the generator program in public, E030-E032). Our later targets cost ~7.3 vs public ~6.6.
-3. Once the engine produces wins, run it at scale with `kaggle/push_shards.py` and merge.
-Deprioritised after testing: cluster-chain / structure-pool planning on structured puzzles (E030-E032),
-random-basis register files (E034), exact single-target re-synthesis (E033).
+1. **True `S3` / GPU-accelerated Meet-in-the-Middle** (RTX 4050 6 GB / multi-thread CPU) to discover exact 6–7 op cones (`priv >= 6`: 1,503 targets in `133,772`) and novel `S2/S3` multi-target hubs (`k = 2..8` target subsets).
+2. **Global constructive leapfrog on structured + independent families**: add explicit target pair/cluster chain search + multiplicative quotient chains (`scored_0577` +56, `scored_0030` +18) and portfolio diversity (`elf2 -construct -multi 8..16` -> CP-SAT recombination over fresh diverse runs without `PUB` cycle bloat) to break individual puzzles below `PUB`.
+3. **Register-aware DAG optimization & E-graph refinement**: fix `E046` CP-SAT cycle bloat (`~303`/puzzle backward 1-op cycles) and improve `-dag` / SA compilation when `max_peak == 49..50` (`scored_0002 = 244`), then scale winning pipelines via `kaggle/push_shards.py` (private kernels) and submit verified scores `< 133,772`.
