@@ -64,3 +64,27 @@ top-10 ~130.5k. Many people grind LNS on the same public programs for ~10s of in
 2. Bootstrap: first target ~20 instr x 1000 puzzles.
 3. Structured families: global choice of hidden bases / shared helpers (Hcub-style benefit) rather
    than target-by-target greed.
+
+## Findings from building our own engine (2026-11-21)
+* Reproduced the public dictionary-beam planner from scratch (`cpp/elf.cpp`); Tony Li's settings give
+  1.45x public best, konbu17-style settings ~1.24x, our best so far (virtual palette + 160 leaves +
+  12-candidate lookahead) ~1.05x on 5 big puzzles.
+* **Register allocation matters for wide planning.** Plans built from 128–200 leaves are 3–5% smaller,
+  but a naive Belady allocator gave it all back (cascading rebuilds of evicted chains). Fixes that
+  worked: emit each target's cone depth-first just before use; let a dying source register receive the
+  result; cost-aware eviction; when a live value is evicted, add pseudo-uses for its inputs
+  (rematerialisation-aware Belady); allow evicting start values once nothing can need them. With plan
+  order + evictable seeds the allocator reproduces every public program's length exactly.
+* **Constants palette**: making 1, 2^k and small odd constants free leaves (Tony Li) helps greedy
+  planning on independent puzzles (they are a reduction basis), but with lookahead the planner is much
+  better when constants are charged at their real build cost (virtual palette): 935 -> 893 on 5 big
+  puzzles.
+* Deeper per-target search (Bloom S3 level, exact 6-op MITM, 2-op factors at the root) changes totals
+  by <3%; per-target search is not the bottleneck. Sharing across targets is.
+* **Hidden bases** can be recovered statistically from the targets alone (pairwise gcd of slightly
+  offset targets with a multiple-testing-corrected binomial test); 104 scored puzzles have them. Seeding
+  them as helper targets improves our planner ~5% on those puzzles, but public programs are still ~20%
+  better there because they also exploit cluster chains (each next target 1–2 ops from the previous one
+  using cheap differences derived from the start values) and second-level multipliers.
+* LNS that removes k<=4 targets and re-plans them with our planner finds nothing on public programs
+  (locally tight). Public LNS tools are saturated on the public frontier (goodpjw2008's history).
