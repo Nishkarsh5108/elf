@@ -56,6 +56,7 @@ struct Params {
     double alpha = 0.16;
     int construct = 0;
     int multi = 1;
+    int beam_width = 0;
     int lookahead = 10;
     double la_weight = 0.35;
     int la_alts = 4;
@@ -64,6 +65,7 @@ struct Params {
     double eq_prob = 0.20;
     int kick_stall = 50;
     int reorder_tries = 32;
+    int dag_sa_iters = 20000;
     int seed = 1;
     int verbose = 0;
     string lns_path;
@@ -76,6 +78,8 @@ struct Params {
     string pool_path;
     string dag_path;
     string pref_path;
+    string dump_recipes_path;
+    string beam_pool_path;
     string sched_test_path;
 };
 
@@ -2243,99 +2247,221 @@ struct Dag {
         if (M <= 1) return eval_order(seq).max_peak <= 48;
 
         vector<vector<int>> deps(n);
+        vector<int> indeg0(n, 0);
         for (int u = ks; u < n; u++) {
             deps[nodes[u].a].push_back(u);
             if (nodes[u].b != nodes[u].a) deps[nodes[u].b].push_back(u);
+            if (nodes[u].a >= ks) indeg0[u]++;
+            if (nodes[u].b >= ks && nodes[u].b != nodes[u].a) indeg0[u]++;
         }
-        vector<int> lu;
-        PeakInfo cur = eval_order(seq, &lu);
-        if (cur.max_peak <= 48) return true;
 
-        vector<int> best_seq = seq;
-        PeakInfo best_info = cur;
-        vector<int> pos(n, -1);
-        for (int i = 0; i < M; i++) pos[seq[i]] = i;
+        PeakInfo g_best_info = eval_order(seq);
+        if (g_best_info.max_peak <= 48) return true;
+        vector<int> g_best_seq = seq;
+
+        auto make_kahn_min_live = [&]() -> vector<int> {
+            vector<int> indeg = indeg0, rem_u(n, 0), ready;
+            for (int u = 0; u < n; u++) rem_u[u] = (int)deps[u].size();
+            for (int u = ks; u < n; u++) if (indeg[u] == 0) ready.push_back(u);
+            vector<int> out;
+            out.reserve(M);
+            while (!ready.empty()) {
+                int best_ri = 0;
+                int best_sc = 1 << 29;
+                for (int ri = 0; ri < (int)ready.size(); ri++) {
+                    int u = ready[ri];
+                    int a = nodes[u].a, b = nodes[u].b;
+                    int freed = (rem_u[a] == 1) + (b != a && rem_u[b] == 1);
+                    int born = deps[u].empty() ? 0 : 1;
+                    int sc = (born - freed) * 16 + (int)(rng() % 5);
+                    if (sc < best_sc) { best_sc = sc; best_ri = ri; }
+                }
+                int u = ready[best_ri];
+                ready[best_ri] = ready.back();
+                ready.pop_back();
+                out.push_back(u);
+                rem_u[nodes[u].a]--;
+                if (nodes[u].b != nodes[u].a) rem_u[nodes[u].b]--;
+                for (int ch : deps[u]) {
+                    if (--indeg[ch] == 0) ready.push_back(ch);
+                }
+            }
+            return (int)out.size() == M ? out : seq;
+        };
+
+        auto perturb_seq = [&](vector<int> s, int kicks) -> vector<int> {
+            vector<int> p(n, -1);
+            for (int i = 0; i < M; i++) p[s[i]] = i;
+            for (int k = 0; k < kicks; k++) {
+                int idx = (int)(rng() % M);
+                int u = s[idx];
+                int lo = 0;
+                if (nodes[u].a >= ks) lo = max(lo, p[nodes[u].a] + 1);
+                if (nodes[u].b >= ks) lo = max(lo, p[nodes[u].b] + 1);
+                int hi = M - 1;
+                for (int ch : deps[u]) hi = min(hi, p[ch] - 1);
+                if (lo >= hi) continue;
+                int np = lo + (int)(rng() % (hi - lo + 1));
+                if (np == idx) continue;
+                s.erase(s.begin() + idx);
+                s.insert(s.begin() + np, u);
+                int mn = min(idx, np), mx = max(idx, np);
+                for (int i = mn; i <= mx; i++) p[s[i]] = i;
+            }
+            return s;
+        };
 
         auto score_pi = [](const PeakInfo &pi) {
             return pi.max_peak * 100.0 + pi.over48 * 2.5;
         };
-        double curE = score_pi(cur);
 
-        vector<int> cand_u;
-        vector<int> trial;
-        for (int it = 0; it < max_iters; it++) {
-            if (best_info.max_peak <= 48) break;
-            int idx = -1;
-            if (rng() % 100 < 75) {
-                cand_u.clear();
-                int w = cur.worst_idx;
-                for (int i = 0; i < M; i++) {
-                    int u = seq[i];
-                    if ((i <= w && lu[u] >= w) || abs(i - w) <= 3 || (lu[u] >= w && lu[u] <= w + 6)) {
-                        cand_u.push_back(i);
+        int n_restarts = (max_iters >= 60000) ? 4 : 1;
+        int iters_per_restart = max(1, max_iters / n_restarts);
+
+        for (int rst = 0; rst < n_restarts; rst++) {
+            vector<int> cur_seq;
+            if (rst == 0) cur_seq = seq;
+            else if (rst == 1 || rst == 3) cur_seq = make_kahn_min_live();
+            else cur_seq = perturb_seq(g_best_seq, 40);
+
+            vector<int> lu;
+            PeakInfo cur = eval_order(cur_seq, &lu);
+            if (cur.max_peak <= 48) { seq = move(cur_seq); return true; }
+
+            vector<int> pos(n, -1);
+            for (int i = 0; i < M; i++) pos[cur_seq[i]] = i;
+            double curE = score_pi(cur);
+
+            if (cur.max_peak < g_best_info.max_peak ||
+                (cur.max_peak == g_best_info.max_peak && cur.over48 < g_best_info.over48)) {
+                g_best_info = cur;
+                g_best_seq = cur_seq;
+            }
+
+            vector<int> cand_u, trial, chosen_seq;
+            for (int it = 0; it < iters_per_restart; it++) {
+                if (g_best_info.max_peak <= 48) break;
+
+                bool two_node_tried = false;
+                double chosen_E = 1e18;
+                chosen_seq.clear();
+
+                // ~25% 2-node / consumer-pull moves targeting nodes live across cur.worst_idx
+                if (rng() % 100 < 25) {
+                    cand_u.clear();
+                    int w = cur.worst_idx;
+                    for (int i = 0; i <= w && i < M; i++) {
+                        int u = cur_seq[i];
+                        if (lu[u] >= w && !deps[u].empty()) cand_u.push_back(i);
+                    }
+                    if (!cand_u.empty()) {
+                        int idx = cand_u[rng() % cand_u.size()];
+                        int u = cur_seq[idx];
+                        int cpos = lu[u];
+                        if (cpos > idx && cpos < M) {
+                            int ch = cur_seq[cpos];
+                            int clo = 0;
+                            if (nodes[ch].a >= ks) clo = max(clo, pos[nodes[ch].a] + 1);
+                            if (nodes[ch].b >= ks) clo = max(clo, pos[nodes[ch].b] + 1);
+                            if (clo < cpos) {
+                                two_node_tried = true;
+                                trial = cur_seq;
+                                trial.erase(trial.begin() + cpos);
+                                trial.insert(trial.begin() + clo, ch);
+                                PeakInfo pi1 = eval_order(trial);
+                                double E1 = score_pi(pi1);
+                                if (E1 < chosen_E) { chosen_E = E1; chosen_seq = trial; }
+
+                                // Also try pushing u right before its earliest consumer after pulling ch
+                                int u_min_ch = M - 1;
+                                for (int k = idx + 1; k < M; k++) {
+                                    int d = trial[k];
+                                    if (nodes[d].a == u || nodes[d].b == u) { u_min_ch = k; break; }
+                                }
+                                int u_hi = u_min_ch - 1;
+                                if (u_hi > idx) {
+                                    trial.erase(trial.begin() + idx);
+                                    trial.insert(trial.begin() + u_hi, u);
+                                    PeakInfo pi2 = eval_order(trial);
+                                    double E2 = score_pi(pi2);
+                                    if (E2 < chosen_E) { chosen_E = E2; chosen_seq = move(trial); }
+                                }
+                            }
+                        }
                     }
                 }
-                if (!cand_u.empty()) idx = cand_u[rng() % cand_u.size()];
-            }
-            if (idx < 0) idx = (int)(rng() % M);
 
-            int u = seq[idx];
-            int a = nodes[u].a, b = nodes[u].b;
-            int lo = 0;
-            if (a >= ks) lo = max(lo, pos[a] + 1);
-            if (b >= ks) lo = max(lo, pos[b] + 1);
-            // After erasing idx (< pos[w] for every child w), child index shifts left by 1
-            int hi = M - 1;
-            for (int ch : deps[u]) hi = min(hi, pos[ch] - 1);
-            if (lo >= hi) continue;
+                if (!two_node_tried) {
+                    int idx = -1;
+                    if (rng() % 100 < 75) {
+                        cand_u.clear();
+                        int w = cur.worst_idx;
+                        for (int i = 0; i < M; i++) {
+                            int u = cur_seq[i];
+                            if ((i <= w && lu[u] >= w) || abs(i - w) <= 3 || (lu[u] >= w && lu[u] <= w + 6)) {
+                                cand_u.push_back(i);
+                            }
+                        }
+                        if (!cand_u.empty()) idx = cand_u[rng() % cand_u.size()];
+                    }
+                    if (idx < 0) idx = (int)(rng() % M);
 
-            // Sample up to 4 candidate target positions in [lo, hi]
-            int opts[4];
-            int nopt = 0;
-            auto add_opt = [&](int p) {
-                if (p == idx || p < lo || p > hi) return;
-                for (int k = 0; k < nopt; k++) if (opts[k] == p) return;
-                opts[nopt++] = p;
-            };
-            add_opt(hi);
-            add_opt(lo);
-            if (cur.worst_idx < idx) add_opt(max(lo, min(hi, cur.worst_idx - 1)));
-            else add_opt(max(lo, min(hi, cur.worst_idx + 1)));
-            add_opt(lo + (int)(rng() % (hi - lo + 1)));
-            if (nopt == 0) continue;
+                    int u = cur_seq[idx];
+                    int a = nodes[u].a, b = nodes[u].b;
+                    int lo = 0;
+                    if (a >= ks) lo = max(lo, pos[a] + 1);
+                    if (b >= ks) lo = max(lo, pos[b] + 1);
+                    int hi = M - 1;
+                    for (int ch : deps[u]) hi = min(hi, pos[ch] - 1);
+                    if (lo >= hi) continue;
 
-            int chosen_p = -1;
-            PeakInfo chosen_pi{999, 999999, 0};
-            double chosen_E = 1e18;
-            for (int k = 0; k < nopt; k++) {
-                int np = opts[k];
-                trial = seq;
-                trial.erase(trial.begin() + idx);
-                trial.insert(trial.begin() + np, u);
-                PeakInfo pi = eval_order(trial);
-                double E = score_pi(pi);
-                if (E < chosen_E || (E == chosen_E && np > chosen_p)) {
-                    chosen_E = E; chosen_p = np; chosen_pi = pi;
+                    int opts[4];
+                    int nopt = 0;
+                    auto add_opt = [&](int p) {
+                        if (p == idx || p < lo || p > hi) return;
+                        for (int k = 0; k < nopt; k++) if (opts[k] == p) return;
+                        opts[nopt++] = p;
+                    };
+                    add_opt(hi);
+                    add_opt(lo);
+                    if (cur.worst_idx < idx) add_opt(max(lo, min(hi, cur.worst_idx - 1)));
+                    else add_opt(max(lo, min(hi, cur.worst_idx + 1)));
+                    add_opt(lo + (int)(rng() % (hi - lo + 1)));
+                    if (nopt == 0) continue;
+
+                    int chosen_p = -1;
+                    for (int k = 0; k < nopt; k++) {
+                        int np = opts[k];
+                        trial = cur_seq;
+                        trial.erase(trial.begin() + idx);
+                        trial.insert(trial.begin() + np, u);
+                        PeakInfo pi = eval_order(trial);
+                        double E = score_pi(pi);
+                        if (E < chosen_E || (E == chosen_E && np > chosen_p)) {
+                            chosen_E = E; chosen_p = np; chosen_seq = move(trial);
+                        }
+                    }
+                }
+
+                if (chosen_seq.empty()) continue;
+                double temp = max(0.05, 4.0 * (1.0 - (double)it / (double)iters_per_restart));
+                double dE = chosen_E - curE;
+                if (dE <= 0.0 || ((double)(rng() % 10000) / 10000.0) < exp(-dE / temp)) {
+                    cur_seq.swap(chosen_seq);
+                    for (int k = 0; k < M; k++) pos[cur_seq[k]] = k;
+                    cur = eval_order(cur_seq, &lu);
+                    curE = score_pi(cur);
+                    if (cur.max_peak < g_best_info.max_peak ||
+                        (cur.max_peak == g_best_info.max_peak && cur.over48 < g_best_info.over48)) {
+                        g_best_info = cur;
+                        g_best_seq = cur_seq;
+                    }
                 }
             }
-            double temp = max(0.05, 4.0 * (1.0 - (double)it / (double)max_iters));
-            double dE = chosen_E - curE;
-            if (dE <= 0.0 || ((double)(rng() % 10000) / 10000.0) < exp(-dE / temp)) {
-                seq.erase(seq.begin() + idx);
-                seq.insert(seq.begin() + chosen_p, u);
-                int mn = min(idx, chosen_p), mx = max(idx, chosen_p);
-                for (int k = mn; k <= mx; k++) pos[seq[k]] = k;
-                cur = eval_order(seq, &lu);
-                curE = score_pi(cur);
-                if (cur.max_peak < best_info.max_peak ||
-                    (cur.max_peak == best_info.max_peak && cur.over48 < best_info.over48)) {
-                    best_info = cur;
-                    best_seq = seq;
-                }
-            }
+            if (g_best_info.max_peak <= 48) break;
         }
-        seq = move(best_seq);
-        return best_info.max_peak <= 48;
+        seq = move(g_best_seq);
+        return g_best_info.max_peak <= 48;
     }
 
     // Build topological order preserving kept_ord while optimally inserting new nodes & repairing >48 peak
@@ -2810,7 +2936,8 @@ struct LnsResult {
     int iters = 0;
     int rej_strict = 0;
     int rej_eq = 0;
-    array<u64, 5> move_wins{};  // A, B, C, D, E
+    array<u64, 6> move_wins{};  // 0..5
+    vector<Step> harvested_recipes;
     SearchStats stats;
 };
 
@@ -3585,6 +3712,24 @@ static LnsResult sa_optimize(u64 L, const vector<u64> &starts, const vector<u64>
     int best_unc_pk = 999;
     unordered_set<u64> failed_compile_hashes;
 
+    bool do_harvest = !P.dump_recipes_path.empty();
+    unordered_set<u64> seen_rec_keys;
+    auto harvest_dag = [&](const Dag &dg) {
+        if (!do_harvest || res.harvested_recipes.size() >= 2500) return;
+        if ((int)dg.nodes.size() - dg.ks > (int)init_prog.size() + 2) return;
+        for (int u = dg.ks; u < (int)dg.nodes.size(); u++) {
+            const auto &nd = dg.nodes[u];
+            u64 av = dg.nodes[nd.a].v, bv = dg.nodes[nd.b].v;
+            if ((nd.op == '+' || nd.op == '*') && av > bv) swap(av, bv);
+            u64 k = mix64(nd.v ^ ((u64)(unsigned char)nd.op << 56)) ^ mix64(av * 0x9e3779b97f4a7c15ULL + bv);
+            if (seen_rec_keys.insert(k).second) {
+                res.harvested_recipes.push_back({nd.op, av, bv, nd.v});
+                if (res.harvested_recipes.size() >= 2500) break;
+            }
+        }
+    };
+    harvest_dag(cur_dag);
+
     const int sa_n1 = min(P.n_leaves, 88);
     const int sa_k2 = min(P.s2_leaves, 24);
     const size_t sa_cap = min<size_t>(P.s2_cap, 100000);
@@ -3739,7 +3884,8 @@ static LnsResult sa_optimize(u64 L, const vector<u64> &starts, const vector<u64>
                 failed_compile_hashes.clear();
                 res.strict_acc++;
                 if (cs.eng >= 1 && cs.eng <= 5) res.stats.wins[cs.eng]++;
-                if (move_type >= 0 && move_type < 5) res.move_wins[move_type]++;
+                if (move_type >= 0 && move_type < 6) res.move_wins[move_type]++;
+                harvest_dag(cur_dag);
                 rebuild_pdict();
                 if (P.verbose > 1) {
                     fprintf(stderr, "  [%s] SA iter=%d STRICT %zu (mv=%d eng=%d dag=%d pk=%d)\n",
@@ -3764,6 +3910,7 @@ static LnsResult sa_optimize(u64 L, const vector<u64> &starts, const vector<u64>
             cur_E = cs.E;
             cur_hash = cs.h;
             res.eq_acc++;
+            harvest_dag(cur_dag);
             rebuild_pdict();
             return true;
         }
@@ -3801,7 +3948,7 @@ static LnsResult sa_optimize(u64 L, const vector<u64> &starts, const vector<u64>
         int n = (int)cur_dag.nodes.size();
         int roll = (int)(rng() % 100);
 
-        if (roll < 45 || nt == 1) {
+        if (roll < 35 || nt == 1) {
             // Move 0: k=1 single-target SA on persistent pdict (ZERO dict rebuild)
             vector<int> wts(nt, 1);
             int wsum = 0;
@@ -3846,7 +3993,58 @@ static LnsResult sa_optimize(u64 L, const vector<u64> &starts, const vector<u64>
             }
             if (best_cand.valid) commit_cand_sa(best_cand, 0, temp);
 
-        } else if (roll < 65) {
+        } else if (roll < 55) {
+            // Move 5: Helper-rooted dom_cut(u) subtree destroy (rs in [2, 12], DeepSearch mode 2)
+            unordered_set<int> isT(cur_dag.tnode.begin(), cur_dag.tnode.end());
+            vector<int> shared_u;
+            for (int u = cur_dag.ks; u < n; u++) {
+                if (!isT.count(u) && cur_dag.users[u].size() >= 2) shared_u.push_back(u);
+            }
+            if (shared_u.empty()) continue;
+
+            int picked_u = -1, rs = 0;
+            vector<char> inR(n, 0);
+            for (int att = 0; att < 8; att++) {
+                int u = shared_u[rng() % shared_u.size()];
+                vector<char> vis(n, 0);
+                vector<int> st;
+                for (int tn : cur_dag.tnode) if (tn != u) st.push_back(tn);
+                while (!st.empty()) {
+                    int x = st.back(); st.pop_back();
+                    if (x < cur_dag.ks || x == u || vis[x]) continue;
+                    vis[x] = 1;
+                    st.push_back(cur_dag.nodes[x].a);
+                    st.push_back(cur_dag.nodes[x].b);
+                }
+                int cnt = 0;
+                fill(inR.begin(), inR.end(), 0);
+                for (int x = cur_dag.ks; x < n; x++) if (!vis[x]) { inR[x] = 1; cnt++; }
+                if (cnt >= 2 && cnt <= 12) { picked_u = u; rs = cnt; break; }
+            }
+            if (picked_u < 0) continue;
+
+            vector<char> excl = compute_excl(inR, {picked_u});
+            vector<char> excl_s0(pdict.n0, 0);
+            for (int i = 0; i < pdict.n0; i++) excl_s0[i] = excl[pdict_s0_dag[i]];
+            auto excl_vals = collect_excl_vals(excl, inR);
+
+            DeepSearch ds(pdict, P, rng);
+            ds.deep_beam = false;
+            ds.excl_s0 = &excl_s0;
+            ds.excl_vals = excl_vals.empty() ? nullptr : &excl_vals;
+            auto sols = ds.search(cur_dag.nodes[picked_u].v, rs + 1, 6, 1, res.stats, 2);
+
+            vector<CandState> cands;
+            for (const auto &sol : sols) {
+                CandState cs = eval_cand_dag(inR, sol.steps, 6);
+                if (cs.valid) cands.push_back(move(cs));
+            }
+            sort(cands.begin(), cands.end(), [](const CandState &a, const CandState &b) { return a.E < b.E; });
+            for (auto &cs : cands) {
+                if (commit_cand_sa(cs, 5, temp)) break;
+            }
+
+        } else if (roll < 68) {
             // Move 1: Shared-helper cone replacement (users >= 2) on persistent pdict
             unordered_set<int> isT(cur_dag.tnode.begin(), cur_dag.tnode.end());
             vector<int> helpers;
@@ -4436,6 +4634,444 @@ static vector<Instr> construct_puzzle(u64 L, const vector<u64> &starts, const ve
     if (!dag.compile(prog, max(P.reorder_tries, 64), rng, &order, nullptr, 20000))
         throw runtime_error("construct compile fail");
     return prog;
+}
+
+static vector<u64> discover_cf_and_gcd_bases(u64 L, const vector<u64> &targets_sub,
+                                             const unordered_set<u64> &have,
+                                             const unordered_set<u64> &banned_vals);
+
+static vector<Instr> construct_beam_puzzle(
+    u64 L, const vector<u64> &starts, const vector<u64> &targets,
+    const Params &P, const string &pid, mt19937_64 &rng, SearchStats &stats,
+    vector<vector<Instr>> *all_beam_progs = nullptr,
+    vector<Step> *out_recipes = nullptr) {
+
+    int nt = (int)targets.size();
+    unordered_set<u64> tset(targets.begin(), targets.end());
+    unordered_set<u64> sset_global(starts.begin(), starts.end());
+    unordered_set<u64> empty_ban;
+    vector<u64> bonus_hubs = discover_cf_and_gcd_bases(L, targets, sset_global, empty_ban);
+    unordered_set<u64> base_near(bonus_hubs.begin(), bonus_hubs.end());
+
+    struct BeamState {
+        vector<u64> built;
+        vector<u64> order;
+        unordered_set<u64> have;
+        map<u64, Step> defs;
+        unordered_map<u64, int> fanout;
+        unordered_map<u64, int> def_pos;
+        u64 solved_mask = 0;
+        int unsolved_cnt = 0;
+        double score = 0.0;
+        u64 sig = 0;
+        bool boot_ladder_used = false;
+    };
+
+    auto refresh_solved = [&](BeamState &S) {
+        u64 m = 0;
+        int un = 0;
+        for (int ti = 0; ti < nt; ti++) {
+            if (S.have.count(targets[ti])) {
+                if (ti < 64) m |= (1ULL << ti);
+            } else {
+                un++;
+            }
+        }
+        S.solved_mask = m;
+        S.unsolved_cnt = un;
+    };
+
+    auto recompute_sig = [&](BeamState &S) {
+        u64 h = mix64(S.solved_mask ^ ((u64)S.order.size() * 0x9e3779b97f4a7c15ULL));
+        for (u64 v : S.order) h ^= mix64(v);
+        S.sig = h;
+    };
+
+    auto apply_steps_state = [&](BeamState &S, const vector<Step> &steps) {
+        for (const auto &s : steps) {
+            if (!S.have.count(s.r)) {
+                u64 chk = 0;
+                if (!S.have.count(s.a) || !S.have.count(s.b) || !apply_op(s.op, s.a, s.b, L, chk) || chk != s.r) continue;
+                S.have.insert(s.r);
+                S.built.push_back(s.r);
+                S.defs[s.r] = s;
+                S.order.push_back(s.r);
+                S.def_pos[s.r] = (int)S.order.size() - 1;
+                S.fanout[s.a]++;
+                if (s.b != s.a) S.fanout[s.b]++;
+            }
+        }
+        refresh_solved(S);
+        recompute_sig(S);
+    };
+
+    function<void(BeamState &, u64)> build_binary_state = [&](BeamState &S, u64 v) {
+        if (S.have.count(v)) return;
+        if (v == 1 && !starts.empty()) {
+            u64 s0 = starts[0];
+            apply_steps_state(S, {{'/', s0, s0, 1}});
+            return;
+        }
+        build_binary_state(S, v / 2);
+        apply_steps_state(S, {{'+', v / 2, v / 2, (v / 2) * 2}});
+        if (v % 2) {
+            build_binary_state(S, 1);
+            apply_steps_state(S, {{'+', (v / 2) * 2, 1, v}});
+        }
+    };
+
+    auto apply_boot_ladder = [&](BeamState &S) -> bool {
+        if (S.boot_ladder_used || starts.empty()) return false;
+        S.boot_ladder_used = true;
+        size_t before = S.order.size();
+        u64 s0 = starts[0];
+        if (!S.have.count(1)) apply_steps_state(S, {{'/', s0, s0, 1}});
+        vector<u64> pws{1, 2, 4, 16, 256, 65536};
+        if (!S.have.count(2) && 2 <= L) apply_steps_state(S, {{'+', 1, 1, 2}});
+        for (size_t pi = 2; pi < pws.size(); pi++) {
+            u64 prev = pws[pi - 1];
+            if (S.have.count(prev) && (u128)prev * prev <= (u128)L) {
+                apply_steps_state(S, {{'*', prev, prev, prev * prev}});
+            }
+        }
+        if (starts.size() >= 2 && (u128)starts[0] * starts[1] <= (u128)L) {
+            apply_steps_state(S, {{'*', starts[0], starts[1], starts[0] * starts[1]}});
+        }
+        return S.order.size() > before;
+    };
+
+    BeamState S0;
+    S0.built.assign(starts.begin(), starts.end());
+    S0.have.insert(starts.begin(), starts.end());
+    refresh_solved(S0);
+    recompute_sig(S0);
+
+    vector<BeamState> beam, finished;
+    if (S0.unsolved_cnt == 0) {
+        finished.push_back(S0);
+    } else {
+        beam.push_back(S0);
+        // Optional 1..4-op start-diff / power seed for low-start puzzles when W >= 2
+        if (P.beam_width >= 2 && starts.size() <= 2 && !starts.empty() && *max_element(starts.begin(), starts.end()) > 32) {
+            BeamState S1 = S0;
+            u64 s0 = starts[0];
+            if (!S1.have.count(1)) apply_steps_state(S1, {{'/', s0, s0, 1}});
+            if (!S1.have.count(2) && 2 <= L) apply_steps_state(S1, {{'+', 1, 1, 2}});
+            if (!S1.have.count(4) && 4 <= L) apply_steps_state(S1, {{'+', 2, 2, 4}});
+            if (starts.size() == 2 && starts[0] != starts[1]) {
+                u64 df = starts[0] > starts[1] ? starts[0] - starts[1] : starts[1] - starts[0];
+                if (df > 0 && df <= L && !S1.have.count(df)) {
+                    apply_steps_state(S1, {{'-', max(starts[0], starts[1]), min(starts[0], starts[1]), df}});
+                }
+            }
+            if (S1.sig != S0.sig) {
+                S1.score = (double)S1.order.size();
+                if (S1.unsolved_cnt == 0) finished.push_back(move(S1));
+                else beam.push_back(move(S1));
+            }
+        }
+    }
+
+    const int b_n1 = min(P.n_leaves, 112);
+    const int b_k2 = min(P.s2_leaves, 32);
+    const size_t b_cap = min<size_t>(P.s2_cap, 160000);
+
+    PoolDict dict;
+    DeepSearch ds(dict, P, rng);
+
+    int guard = 0;
+    while (!beam.empty() && guard++ < nt + 4) {
+        vector<BeamState> next_states;
+        int min_rem = nt;
+
+        struct PlanCand { u64 target; int cost; int eng; vector<Step> steps; };
+        struct LightCand { double score; size_t nnew; u64 target; vector<Step> steps; };
+
+        auto expand_state = [&](BeamState &S) {
+            vector<u64> rem;
+            for (u64 t : targets) if (!S.have.count(t)) rem.push_back(t);
+            if (rem.empty()) { finished.push_back(S); return; }
+            min_rem = min(min_rem, (int)rem.size());
+
+            vector<u64> rem_sorted = rem;
+            sort(rem_sorted.begin(), rem_sorted.end());
+            u64 t_min = rem_sorted[0];
+
+            auto build_s_dict = [&]() {
+                vector<u64> leaves, done_t;
+                vector<int> lcosts;
+                int s1_cnt = 0;
+                double tb = now_sec();
+                select_leaves(L, starts, S.built, tset, S.fanout, base_near, b_n1, leaves, lcosts, s1_cnt, done_t, true);
+                dict.build(L, starts, S.built, leaves, lcosts, s1_cnt, done_t, b_k2, b_cap);
+                stats.sec[0] += now_sec() - tb;
+            };
+            build_s_dict();
+
+            vector<PlanCand> cands;
+            int min_fast = 1 << 20;
+            for (u64 t : rem) {
+                auto sols = ds.search(t, 10, 3, 1, stats, 1);
+                for (auto &sol : sols) {
+                    min_fast = min(min_fast, sol.cost);
+                    cands.push_back({t, sol.cost, sol.engine, move(sol.steps)});
+                }
+            }
+            if (min_fast > 5) {
+                for (size_t i = 0; i < rem_sorted.size() && (i < 10 || cands.empty()); i++) {
+                    auto sols = ds.search(rem_sorted[i], 28, 3, 1, stats, 2);
+                    for (auto &sol : sols) cands.push_back({rem_sorted[i], sol.cost, sol.engine, move(sol.steps)});
+                }
+            }
+
+            if (cands.empty()) {
+                auto boot = ds.search(t_min, 36, 1, 0, stats, 3);
+                if (!boot.empty()) {
+                    BeamState ch = S;
+                    apply_steps_state(ch, boot[0].steps);
+                    ch.score = (double)ch.order.size();
+                    if (ch.unsolved_cnt == 0) finished.push_back(move(ch));
+                    else next_states.push_back(move(ch));
+                    return;
+                }
+                BeamState Sb = S;
+                if (apply_boot_ladder(Sb)) {
+                    vector<u64> rem_b;
+                    for (u64 t : targets) if (!Sb.have.count(t)) rem_b.push_back(t);
+                    if (rem_b.empty()) {
+                        Sb.score = (double)Sb.order.size();
+                        finished.push_back(move(Sb));
+                        return;
+                    }
+                    vector<u64> leaves, done_t;
+                    vector<int> lcosts;
+                    int s1_cnt = 0;
+                    select_leaves(L, starts, Sb.built, tset, Sb.fanout, base_near, b_n1, leaves, lcosts, s1_cnt, done_t, true);
+                    dict.build(L, starts, Sb.built, leaves, lcosts, s1_cnt, done_t, b_k2, b_cap);
+                    vector<u64> rbs = rem_b;
+                    sort(rbs.begin(), rbs.end());
+                    for (size_t i = 0; i < rbs.size() && (i < 10 || cands.empty()); i++) {
+                        auto sols = ds.search(rbs[i], 28, 3, 1, stats, 2);
+                        for (auto &sol : sols) cands.push_back({rbs[i], sol.cost, sol.engine, move(sol.steps)});
+                    }
+                    if (!cands.empty()) {
+                        S = move(Sb);
+                        rem.swap(rem_b);
+                        rem_sorted.swap(rbs);
+                        t_min = rem_sorted[0];
+                    } else {
+                        build_binary_state(Sb, rbs[0]);
+                        Sb.score = (double)Sb.order.size();
+                        if (Sb.unsolved_cnt == 0) finished.push_back(move(Sb));
+                        else next_states.push_back(move(Sb));
+                        return;
+                    }
+                } else {
+                    build_binary_state(Sb, t_min);
+                    Sb.score = (double)Sb.order.size();
+                    if (Sb.unsolved_cnt == 0) finished.push_back(move(Sb));
+                    else next_states.push_back(move(Sb));
+                    return;
+                }
+            }
+
+            // Group candidates by target, rank targets by minimum cost, take <= 6 distinct targets (top 5 + smallest)
+            unordered_map<u64, vector<PlanCand>> by_t;
+            for (auto &c : cands) by_t[c.target].push_back(move(c));
+            vector<pair<int, u64>> t_rank;
+            t_rank.reserve(by_t.size());
+            for (auto &[tv, vec] : by_t) {
+                sort(vec.begin(), vec.end(), [](const PlanCand &a, const PlanCand &b) {
+                    if (a.cost != b.cost) return a.cost < b.cost;
+                    return a.steps.size() < b.steps.size();
+                });
+                t_rank.emplace_back(vec[0].cost, tv);
+            }
+            sort(t_rank.begin(), t_rank.end());
+
+            vector<u64> picked_t;
+            unordered_set<u64> picked_set;
+            for (size_t i = 0; i < t_rank.size() && picked_t.size() < 5; i++) {
+                picked_t.push_back(t_rank[i].second);
+                picked_set.insert(t_rank[i].second);
+            }
+            if (by_t.count(t_min) && !picked_set.count(t_min)) {
+                picked_t.push_back(t_min);
+                picked_set.insert(t_min);
+            } else if (picked_t.size() < 6 && t_rank.size() > 5) {
+                picked_t.push_back(t_rank[5].second);
+                picked_set.insert(t_rank[5].second);
+            }
+
+            vector<LightCand> evals;
+            int cur_ord_n = (int)S.order.size();
+            for (u64 pt : picked_t) {
+                auto &vec = by_t[pt];
+                size_t rlim = min<size_t>(vec.size(), 3);
+                for (size_t ri = 0; ri < rlim; ri++) {
+                    vector<u64> add_v;
+                    unordered_set<u64> made;
+                    for (const auto &st : vec[ri].steps) {
+                        if (!S.have.count(st.r) && made.insert(st.r).second) add_v.push_back(st.r);
+                    }
+                    int old_reuses = 0;
+                    for (const auto &st : vec[ri].steps) {
+                        for (u64 opv : {st.a, st.b}) {
+                            if (sset_global.count(opv) || made.count(opv)) continue;
+                            auto it_dp = S.def_pos.find(opv);
+                            if (it_dp != S.def_pos.end() && cur_ord_n - it_dp->second > 42) {
+                                auto it_f = S.fanout.find(opv);
+                                if (it_f != S.fanout.end() && it_f->second <= 2) old_reuses++;
+                            }
+                        }
+                    }
+
+                    auto mk = dict.mark();
+                    dict.add_leaves_inc(add_v);
+                    ds.extra_pool = made;
+                    double rem_est = 0.0;
+                    int div_hits = 0;
+                    for (u64 x : rem) {
+                        if (S.have.count(x) || made.count(x)) continue;
+                        rem_est += ds.estimate_cost(x);
+                        if (x >= 16) {
+                            for (u64 nv : add_v) {
+                                if (nv < 16) continue;
+                                u64 rmod = x % nv;
+                                u64 dclose = rmod == 0 ? 0 : min(rmod, nv - rmod);
+                                if (dclose <= 64) { div_hits++; break; }
+                            }
+                        }
+                    }
+                    ds.extra_pool.clear();
+                    dict.rollback(mk);
+
+                    double div_bonus = min(3.0, 0.6 * (double)div_hits);
+                    double sc = (double)(cur_ord_n + (int)add_v.size()) + P.la_weight * rem_est
+                                + 0.25 * (double)old_reuses - div_bonus;
+                    evals.push_back({sc, add_v.size(), pt, vec[ri].steps});
+                }
+            }
+            sort(evals.begin(), evals.end(), [](const LightCand &a, const LightCand &b) {
+                if (a.score != b.score) return a.score < b.score;
+                if (a.nnew != b.nnew) return a.nnew < b.nnew;
+                return a.target < b.target;
+            });
+            size_t take_c = min<size_t>(evals.size(), 4);
+            for (size_t ci = 0; ci < take_c; ci++) {
+                BeamState ch = S;
+                apply_steps_state(ch, evals[ci].steps);
+                ch.score = evals[ci].score;
+                if (ch.unsolved_cnt == 0) finished.push_back(move(ch));
+                else next_states.push_back(move(ch));
+            }
+        };
+
+        for (size_t si = 0; si < beam.size(); si++) {
+            expand_state(beam[si]);
+        }
+
+        beam.clear();
+        if (!next_states.empty()) {
+            sort(next_states.begin(), next_states.end(), [](const BeamState &a, const BeamState &b) {
+                if (a.score != b.score) return a.score < b.score;
+                return a.order.size() < b.order.size();
+            });
+            unordered_set<u64> seen_sigs;
+            unordered_map<u64, int> mask_cnt;
+            vector<size_t> skipped_idxs;
+            int max_b = max(1, P.beam_width);
+            for (size_t i = 0; i < next_states.size() && (int)beam.size() < max_b; i++) {
+                if (!seen_sigs.insert(next_states[i].sig).second) continue;
+                int &mc = mask_cnt[next_states[i].solved_mask];
+                if (mc >= 2) { skipped_idxs.push_back(i); continue; }
+                mc++;
+                beam.push_back(move(next_states[i]));
+            }
+            if ((int)beam.size() < max_b && min_rem <= 2) {
+                for (size_t i : skipped_idxs) {
+                    if ((int)beam.size() >= max_b) break;
+                    beam.push_back(move(next_states[i]));
+                }
+            }
+        }
+    }
+
+    if (finished.empty()) finished = move(beam);
+    sort(finished.begin(), finished.end(), [](const BeamState &a, const BeamState &b) {
+        if (a.order.size() != b.order.size()) return a.order.size() < b.order.size();
+        return a.score < b.score;
+    });
+
+    unordered_set<u64> seen_fin;
+    vector<vector<Instr>> valid_progs;
+    unordered_set<string> seen_jsons;
+    unordered_set<u64> seen_rec_keys;
+    auto push_dag_recipes = [&](const Dag &dg) {
+        if (!out_recipes || out_recipes->size() >= 2500) return;
+        for (int u = dg.ks; u < (int)dg.nodes.size(); u++) {
+            const auto &nd = dg.nodes[u];
+            u64 av = dg.nodes[nd.a].v, bv = dg.nodes[nd.b].v;
+            if ((nd.op == '+' || nd.op == '*') && av > bv) swap(av, bv);
+            u64 k = mix64(nd.v ^ ((u64)(unsigned char)nd.op << 56)) ^ mix64(av * 0x9e3779b97f4a7c15ULL + bv);
+            if (seen_rec_keys.insert(k).second) {
+                out_recipes->push_back({nd.op, av, bv, nd.v});
+                if (out_recipes->size() >= 2500) break;
+            }
+        }
+    };
+
+    for (const auto &S : finished) {
+        if (!seen_fin.insert(S.sig).second) continue;
+        Dag dag;
+        dag.init(L, starts, targets);
+        if (!dag.from_defs(S.defs, S.order)) continue;
+        push_dag_recipes(dag);
+        vector<Instr> prog;
+        if (!dag.compile(prog, max(P.reorder_tries, 64), rng, &S.order, nullptr, 20000)) continue;
+        if (!verify_prog(L, starts, targets, prog).empty()) continue;
+        string js = to_json(prog);
+        if (seen_jsons.insert(js).second) valid_progs.push_back(move(prog));
+        if ((int)valid_progs.size() >= max(2, P.beam_width)) break;
+    }
+
+    sort(valid_progs.begin(), valid_progs.end(), [](const vector<Instr> &a, const vector<Instr> &b) {
+        return a.size() < b.size();
+    });
+
+    if (P.lns_sec > 0 && !valid_progs.empty()) {
+        int npol = min<int>((int)valid_progs.size(), 2);
+        Params sp = P;
+        sp.lns_sec = P.lns_sec * 0.5;
+        vector<vector<Instr>> sa_progs;
+        for (int i = 0; i < npol; i++) {
+            mt19937_64 srng((u64)(P.seed + (i + 1) * 7919) * 1000003ULL + hash<string>()(pid));
+            auto lr = sa_optimize(L, starts, targets, valid_progs[i], sp, pid, srng);
+            if (verify_prog(L, starts, targets, lr.prog).empty()) {
+                string js = to_json(lr.prog);
+                if (seen_jsons.insert(js).second) sa_progs.push_back(move(lr.prog));
+            }
+            if (out_recipes && out_recipes->size() < 2500) {
+                for (const auto &hr : lr.harvested_recipes) {
+                    u64 av = hr.a, bv = hr.b;
+                    if ((hr.op == '+' || hr.op == '*') && av > bv) swap(av, bv);
+                    u64 k = mix64(hr.r ^ ((u64)(unsigned char)hr.op << 56)) ^ mix64(av * 0x9e3779b97f4a7c15ULL + bv);
+                    if (seen_rec_keys.insert(k).second) {
+                        out_recipes->push_back({hr.op, av, bv, hr.r});
+                        if (out_recipes->size() >= 2500) break;
+                    }
+                }
+            }
+        }
+        for (auto &p : sa_progs) valid_progs.push_back(move(p));
+        sort(valid_progs.begin(), valid_progs.end(), [](const vector<Instr> &a, const vector<Instr> &b) {
+            return a.size() < b.size();
+        });
+    }
+
+    if (all_beam_progs) *all_beam_progs = valid_progs;
+    if (valid_progs.empty()) return {};
+    return valid_progs[0];
 }
 
 // ---------------------------------------------------------------- Driver & Auxiliary Modes
@@ -5064,7 +5700,7 @@ static int run_dag_mode(const vector<PuzzleIn> &puzzles, const Params &P) {
             int dlen = (int)dag.nodes.size() - dag.ks;
             vector<Instr> prog;
             if (!dag.compile(prog, max(P.reorder_tries, 64), rng,
-                             pref_ord.empty() ? nullptr : &pref_ord, nullptr, 20000)) {
+                             pref_ord.empty() ? nullptr : &pref_ord, nullptr, P.dag_sa_iters)) {
                 lock_guard<mutex> g(mu);
                 fprintf(stderr, "%s: DAG compile failed!\n", pz.id.c_str());
                 continue;
@@ -5829,8 +6465,10 @@ int main(int argc, char **argv) {
         else if (a == "-a") P.alpha = stod(nx());
         else if (a == "-construct") P.construct = stoi(nx());
         else if (a == "-multi") P.multi = stoi(nx());
+        else if (a == "-beam") P.beam_width = stoi(nx());
+        else if (a == "-beam_pool") P.beam_pool_path = nx();
         else if (a == "-la") P.lookahead = stoi(nx());
-        else if (a == "-lw") P.la_weight = stod(nx());
+        else if (a == "-la_weight" || a == "-lw") P.la_weight = stod(nx());
         else if (a == "-lalt") P.la_alts = stoi(nx());
         else if (a == "-lns") P.lns_path = nx();
         else if (a == "-sa") P.sa_path = nx();
@@ -5842,6 +6480,8 @@ int main(int argc, char **argv) {
         else if (a == "-pool") P.pool_path = nx();
         else if (a == "-dag") P.dag_path = nx();
         else if (a == "-pref") P.pref_path = nx();
+        else if (a == "-dag_sa") P.dag_sa_iters = stoi(nx());
+        else if (a == "-dump_recipes") P.dump_recipes_path = nx();
         else if (a == "-sched-test") P.sched_test_path = nx();
         else if (a == "-lsec") P.lns_sec = stod(nx());
         else if (a == "-lk") P.lns_kmax = stoi(nx());
@@ -5887,11 +6527,13 @@ int main(int argc, char **argv) {
     else if (!P.lns_path.empty()) lns_in = load_progs_file(P.lns_path);
 
     vector<string> out(puzzles.size());
+    vector<string> rec_dump(puzzles.size());
+    vector<string> beam_pool_dump(puzzles.size());
     atomic<int> nextp{0};
     mutex mu;
     long long total_new = 0, total_old = 0;
     long long tot_rejs = 0, tot_reje = 0;
-    array<u64, 5> tot_mwins{};
+    array<u64, 6> tot_mwins{};
     SearchStats tot_stats;
     double t0 = now_sec();
 
@@ -5906,7 +6548,7 @@ int main(int argc, char **argv) {
                 size_t old_len = 0;
                 SearchStats st;
                 int s_acc = 0, e_acc = 0, iters = 0, rejs = 0, reje = 0;
-                array<u64, 5> mwins{};
+                array<u64, 6> mwins{};
 
                 if (!P.sa_path.empty()) {
                     auto it = lns_in.find(pz.id);
@@ -5917,6 +6559,38 @@ int main(int argc, char **argv) {
                     s_acc = sr.strict_acc; e_acc = sr.eq_acc; iters = sr.iters;
                     rejs = sr.rej_strict; reje = sr.rej_eq; mwins = sr.move_wins;
                     st = sr.stats;
+                    if (!P.dump_recipes_path.empty() && !sr.harvested_recipes.empty()) {
+                        string rd = pz.id + " " + to_string(sr.harvested_recipes.size()) + "\n";
+                        for (const auto &hr : sr.harvested_recipes) {
+                            rd += to_string(hr.r) + " ";
+                            rd.push_back(hr.op);
+                            rd += " " + to_string(hr.a) + " " + to_string(hr.b) + "\n";
+                        }
+                        rec_dump[k] = move(rd);
+                    }
+                } else if (P.beam_width > 0) {
+                    vector<vector<Instr>> all_bp;
+                    vector<Step> brecs;
+                    prog = construct_beam_puzzle(pz.L, pz.s, pz.t, P, pz.id, rng, st,
+                                                 P.beam_pool_path.empty() ? nullptr : &all_bp,
+                                                 P.dump_recipes_path.empty() ? nullptr : &brecs);
+                    old_len = prog.size();
+                    if (!P.beam_pool_path.empty() && !all_bp.empty()) {
+                        string bp = "PUZ " + pz.id + " " + to_string(all_bp[0].size()) + " " + to_string(all_bp.size()) + "\n";
+                        for (const auto &pr : all_bp) {
+                            bp += to_string(pr.size()) + " " + to_json(pr) + "\n";
+                        }
+                        beam_pool_dump[k] = move(bp);
+                    }
+                    if (!P.dump_recipes_path.empty() && !brecs.empty()) {
+                        string rd = pz.id + " " + to_string(brecs.size()) + "\n";
+                        for (const auto &hr : brecs) {
+                            rd += to_string(hr.r) + " ";
+                            rd.push_back(hr.op);
+                            rd += " " + to_string(hr.a) + " " + to_string(hr.b) + "\n";
+                        }
+                        rec_dump[k] = move(rd);
+                    }
                 } else if (P.construct || P.lns_path.empty()) {
                     // Multi-start constructive portfolio
                     int runs = max(1, P.multi);
@@ -5968,14 +6642,14 @@ int main(int argc, char **argv) {
                     tot_stats.wins[e] += st.wins[e];
                     tot_stats.sec[e] += st.sec[e];
                 }
-                for (int m = 0; m < 5; m++) tot_mwins[m] += mwins[m];
+                for (int m = 0; m < 6; m++) tot_mwins[m] += mwins[m];
                 if (P.verbose || !P.lns_path.empty() || !P.sa_path.empty()) {
                     fprintf(stderr,
-                            "%s: %zu -> %zu (%+lld) | sacc=%d eq=%d it=%d rejp=%d/%d | mv=[%llu,%llu,%llu,%llu,%llu] hits=[%llu,%llu,%llu,%llu,%llu] wins=[%llu,%llu,%llu,%llu,%llu] t=[%.1f|%.1f,%.1f,%.1f,%.1f,%.1f]\n",
+                            "%s: %zu -> %zu (%+lld) | sacc=%d eq=%d it=%d rejp=%d/%d | mv=[%llu,%llu,%llu,%llu,%llu,%llu] hits=[%llu,%llu,%llu,%llu,%llu] wins=[%llu,%llu,%llu,%llu,%llu] t=[%.1f|%.1f,%.1f,%.1f,%.1f,%.1f]\n",
                             pz.id.c_str(), old_len, prog.size(),
                             (long long)prog.size() - (long long)old_len,
                             s_acc, e_acc, iters, rejs, reje,
-                            (unsigned long long)mwins[0], (unsigned long long)mwins[1], (unsigned long long)mwins[2], (unsigned long long)mwins[3], (unsigned long long)mwins[4],
+                            (unsigned long long)mwins[0], (unsigned long long)mwins[1], (unsigned long long)mwins[2], (unsigned long long)mwins[3], (unsigned long long)mwins[4], (unsigned long long)mwins[5],
                             (unsigned long long)st.hits[1], (unsigned long long)st.hits[2],
                             (unsigned long long)st.hits[3], (unsigned long long)st.hits[4], (unsigned long long)st.hits[5],
                             (unsigned long long)st.wins[1], (unsigned long long)st.wins[2],
@@ -5994,6 +6668,20 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nt; i++) th.emplace_back(worker);
     for (auto &t : th) t.join();
 
+    if (!P.dump_recipes_path.empty()) {
+        FILE *fr = fopen(P.dump_recipes_path.c_str(), "w");
+        if (fr) {
+            for (const auto &rs : rec_dump) if (!rs.empty()) fwrite(rs.data(), 1, rs.size(), fr);
+            fclose(fr);
+        }
+    }
+    if (!P.beam_pool_path.empty()) {
+        FILE *fb = fopen(P.beam_pool_path.c_str(), "w");
+        if (fb) {
+            for (const auto &bs : beam_pool_dump) if (!bs.empty()) fwrite(bs.data(), 1, bs.size(), fb);
+            fclose(fb);
+        }
+    }
     if (!P.out_path.empty()) {
         FILE *fo = fopen(P.out_path.c_str(), "w");
         if (!fo) { fprintf(stderr, "cannot open %s\n", P.out_path.c_str()); return 1; }
@@ -6003,10 +6691,10 @@ int main(int argc, char **argv) {
         for (const auto &s : out) if (!s.empty()) printf("%s\n", s.c_str());
     }
     fprintf(stderr,
-            "TOTAL: old=%lld new=%lld (%+lld) time=%.1fs | rejp=%lld/%lld mv=[%llu,%llu,%llu,%llu,%llu] calls=%llu hits=[%llu,%llu,%llu,%llu,%llu] wins=[%llu,%llu,%llu,%llu,%llu] t=[%.1f|%.1f,%.1f,%.1f,%.1f,%.1f]\n",
+            "TOTAL: old=%lld new=%lld (%+lld) time=%.1fs | rejp=%lld/%lld mv=[%llu,%llu,%llu,%llu,%llu,%llu] calls=%llu hits=[%llu,%llu,%llu,%llu,%llu] wins=[%llu,%llu,%llu,%llu,%llu] t=[%.1f|%.1f,%.1f,%.1f,%.1f,%.1f]\n",
             total_old, total_new, total_new - total_old, now_sec() - t0,
             tot_rejs, tot_reje,
-            (unsigned long long)tot_mwins[0], (unsigned long long)tot_mwins[1], (unsigned long long)tot_mwins[2], (unsigned long long)tot_mwins[3], (unsigned long long)tot_mwins[4],
+            (unsigned long long)tot_mwins[0], (unsigned long long)tot_mwins[1], (unsigned long long)tot_mwins[2], (unsigned long long)tot_mwins[3], (unsigned long long)tot_mwins[4], (unsigned long long)tot_mwins[5],
             (unsigned long long)tot_stats.calls,
             (unsigned long long)tot_stats.hits[1], (unsigned long long)tot_stats.hits[2],
             (unsigned long long)tot_stats.hits[3], (unsigned long long)tot_stats.hits[4], (unsigned long long)tot_stats.hits[5],
