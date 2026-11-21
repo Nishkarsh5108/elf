@@ -39,10 +39,20 @@ our submissions exactly).
 | + lookahead `-la 6` | 20 puzzles | 1.214 |
 | heavy `-w 30 -n 128 -la 12 -lalt 4 -lwidth 6` | 5 big puzzles | 1.074 |
 | with discovered bases as helper targets | 104 base puzzles | 1.395 -> 1.330 |
+| **best: `-w 30 -n 160 -nd 100 -la 12 -lalt 4 -lwidth 6 -p 1`** | 100 puzzles | 1.145 (0 wins) |
 LNS from the public best (k<=4 targets re-planned, 20 s/puzzle): 0 improvements on 100 puzzles —
 public programs are locally tight w.r.t. this planner.
 
+## Assessment
+Our engine is ~15% behind the public frontier on a representative sample and has no per-puzzle wins.
+Public programs are planner output polished by many LNS passes (exchange, quartet, anneal, recombination);
+those passes are saturated on the public frontier. The LB leader (128.3k, 4% ahead) must have a stronger
+constructive method. Running public *code* is off the table for us (safety rule on executing downloaded
+code); public *programs* are fine as data.
+
 ## Next steps (in order)
+0. Refresh the public merge daily (`scripts/fetch_public.sh` + `src/merge.py`) � the only source of LB
+   gains so far (133,928 -> 133,860).
 1. Program-level beam search over planner states (generalises 1-step lookahead) — sharing between
    targets is where our planner loses (later targets ~7.3 vs public ~6.6 instr on independent puzzles).
 2. Portfolio over palette mode / leaf counts / bases / seeds, run at scale (Kaggle CPU kernels), merge.

@@ -1076,7 +1076,7 @@ static vector<Instr> lns_improve(const PuzzleIn &pz, vector<Instr> best, Params 
 }
 
 int main(int argc, char **argv) {
-    Params P; string inpath, lnspath; double lns_sec = 10;
+    Params P; string inpath, lnspath, dagpath; double lns_sec = 10;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         auto nx = [&]() { return string(argv[++i]); };
@@ -1099,6 +1099,7 @@ int main(int argc, char **argv) {
         else if (a == "-linc") P.la_inc = stoi(nx());
         else if (a == "-nd") P.n_done = stoi(nx());
         else if (a == "-lns") lnspath = nx();
+        else if (a == "-dag") dagpath = nx();
         else if (a == "-lsec") lns_sec = stod(nx());
         else if (a == "-lk") P.lns_kmax = stoi(nx());
         else if (a == "-mitm") P.mitm = stoi(nx());
@@ -1107,6 +1108,17 @@ int main(int argc, char **argv) {
         else if (a == "-cap") P.dict_cap = stoll(nx());
         else if (a == "-reorder") g_reorder_tries = stoi(nx());
         else inpath = a;
+    }
+    map<string, pair<map<u64, Node>, vector<u64>>> dagin;
+    if (!dagpath.empty()) {  // DAG file: "id n" then n lines "v op a b" in topological order
+        ifstream f(dagpath); string id; int n;
+        while (f >> id >> n) {
+            auto &e = dagin[id];
+            for (int i = 0; i < n; i++) {
+                unsigned long long v, a, b; string op; f >> v >> op >> a >> b;
+                e.first[v] = {v, a, b, op[0]}; e.second.push_back(v);
+            }
+        }
     }
     map<string, vector<Instr>> lnsin;
     if (!lnspath.empty()) {
@@ -1135,6 +1147,19 @@ int main(int argc, char **argv) {
             auto &pz = puzzles[k];
             string res;
             try {
+                if (!dagpath.empty()) {
+                    if (!dagin.count(pz.id)) continue;
+                    auto &dg = dagin[pz.id];
+                    int psz = 0;
+                    auto prog = compile(pz.s, pz.t, dg.first, dg.second, &psz, pz.L);
+                    string why = verify_prog(pz.L, pz.s, pz.t, prog);
+                    if (!why.empty()) throw runtime_error("verify failed: " + why);
+                    res = pz.id + " " + to_string(prog.size()) + " " + to_json(prog);
+                    lock_guard<mutex> g(mu); total += prog.size();
+                    fprintf(stderr, "%s dag=%d prog=%zu\n", pz.id.c_str(), psz, prog.size());
+                    out[k] = res;
+                    continue;
+                }
                 if (!lnspath.empty()) {
                     if (!lnsin.count(pz.id)) continue;
                     Params Q = P; Q.palette = 1;
