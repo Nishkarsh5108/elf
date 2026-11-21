@@ -1,0 +1,1 @@
+{"id": "nishkarshsinghal/elf-smoke-0", "title": "elf-smoke-0", "code_file": "run.py", "language": "python", "kernel_type": "script", "is_private": true, "enable_gpu": false, "enable_internet": false, "dataset_sources": ["nishkarshsinghal/elf-engine"], "competition_sources": ["santa-2026"], "kernel_sources": []}
